@@ -305,6 +305,13 @@ class PreextractedDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.available_indices)
     
+    def _pad_or_truncate(self, features: np.ndarray) -> np.ndarray:
+        """Helper function to pad or truncate features to num_frames."""
+        if len(features) < self.num_frames:
+            padding = np.tile(features[-1:], (self.num_frames - len(features), 1))
+            features = np.vstack([features, padding])
+        return features[:self.num_frames]
+    
     def __getitem__(self, idx):
         # Map to original index
         orig_idx = self.available_indices[idx]
@@ -319,16 +326,9 @@ class PreextractedDataset(torch.utils.data.Dataset):
         landmark_path = self.landmarks_dir / f"{video_id}_landmarks.npy"
         landmarks = np.load(landmark_path)
         
-        # Ensure correct number of frames (pad or truncate)
-        if len(gemma_features) < self.num_frames:
-            padding = np.tile(gemma_features[-1:], (self.num_frames - len(gemma_features), 1))
-            gemma_features = np.vstack([gemma_features, padding])
-        gemma_features = gemma_features[:self.num_frames]
-        
-        if len(landmarks) < self.num_frames:
-            padding = np.tile(landmarks[-1:], (self.num_frames - len(landmarks), 1))
-            landmarks = np.vstack([landmarks, padding])
-        landmarks = landmarks[:self.num_frames]
+        # Pad or truncate to correct number of frames
+        gemma_features = self._pad_or_truncate(gemma_features)
+        landmarks = self._pad_or_truncate(landmarks)
         
         return {
             'gemma_features': torch.tensor(gemma_features, dtype=torch.float32),

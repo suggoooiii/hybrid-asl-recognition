@@ -213,6 +213,14 @@ def main():
     parser.add_argument('--num_frames', type=int, default=16)
     parser.add_argument('--device', type=str, default='cuda')
     
+    # Output paths
+    parser.add_argument('--best_model_path', type=str, default='best_simple_model.pth',
+                        help='Path to save best model')
+    parser.add_argument('--final_model_path', type=str, default='final_simple_model.pth',
+                        help='Path to save final model')
+    parser.add_argument('--label_mapping_path', type=str, default='label_mapping.json',
+                        help='Path to save label mapping')
+    
     # Checkpoint
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_simple',
                         help='Directory to save checkpoints')
@@ -378,7 +386,7 @@ def main():
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_simple_model.pth')
+            torch.save(model.state_dict(), args.best_model_path)
             print(f"  ✓ New best model saved! ({val_acc:.2f}%)")
         
         # Save periodic checkpoint
@@ -398,20 +406,20 @@ def main():
         print()
     
     # Save final model
-    torch.save(model.state_dict(), 'final_simple_model.pth')
+    torch.save(model.state_dict(), args.final_model_path)
     
     print("="*70)
     print("TRAINING COMPLETE!")
     print("="*70)
     print(f"✓ Best validation accuracy: {best_val_acc:.2f}%")
-    print(f"✓ Best model saved to: best_simple_model.pth")
-    print(f"✓ Final model saved to: final_simple_model.pth")
+    print(f"✓ Best model saved to: {args.best_model_path}")
+    print(f"✓ Final model saved to: {args.final_model_path}")
     print(f"✓ Checkpoints saved to: {checkpoint_dir}/")
     
     # Save label mapping
-    with open('label_mapping.json', 'w') as f:
+    with open(args.label_mapping_path, 'w') as f:
         json.dump({str(k): v for k, v in idx_to_gloss.items()}, f, indent=2)
-    print(f"✓ Label mapping saved to: label_mapping.json")
+    print(f"✓ Label mapping saved to: {args.label_mapping_path}")
     print()
 
 

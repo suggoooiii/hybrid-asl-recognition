@@ -87,20 +87,12 @@ class GemmaFeatureExtractor:
     
     def _get_feature_dim(self) -> int:
         """Infer feature dimension from the vision encoder."""
-        # Create dummy input to determine output dimension
-        dummy_image = torch.zeros(1, 3, 224, 224, dtype=torch.float32).to(self.device)
+        # Create dummy input to determine output dimension (as numpy array for processor)
+        dummy_image = np.zeros((224, 224, 3), dtype=np.uint8)
         
         with torch.no_grad():
             try:
-                # Try to access vision tower directly
-                if hasattr(self.model, 'vision_tower'):
-                    outputs = self.model.vision_tower(dummy_image)
-                    if hasattr(outputs, 'last_hidden_state'):
-                        return outputs.last_hidden_state.shape[-1]
-                    elif isinstance(outputs, torch.Tensor):
-                        return outputs.shape[-1]
-                
-                # Fallback: Process through full model
+                # Process through full model using the processor
                 inputs = self.processor(images=dummy_image, return_tensors="pt")
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
                 outputs = self.model(**inputs, output_hidden_states=True)
