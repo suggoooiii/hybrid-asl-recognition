@@ -1,0 +1,23 @@
+# Core ML/DL
+tensorflow>=2.10.0
+numpy
+scipy
+scikit-learn
+
+# Computer Vision & MediaPipe
+opencv-python
+mediapipe
+
+# Data Handling
+pandas
+pickle5  # (or built-in pickle for Python 3.8+)
+tqdm
+
+# Visualization
+matplotlib
+seaborn
+
+# Utilities
+pathlib  # (built-in)
+argparse  # (built-in)
+json      # (built-in)
