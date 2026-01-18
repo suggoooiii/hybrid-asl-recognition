@@ -514,6 +514,7 @@ class HybridASLDataset(torch.utils.data.Dataset):
         - Pre-extracted landmarks for 10-50x faster training:
             - If landmarks_dir is provided, loads {video_id}_landmarks.npy
             - Otherwise, extracts landmarks on-the-fly using landmark_extractor
+        - Data augmentation via video_augment and landmark_augment callables
     """
 
     def __init__(self,
@@ -525,7 +526,9 @@ class HybridASLDataset(torch.utils.data.Dataset):
                  image_size=224,
                  landmarks_dir=None,
                  mode='hybrid',  # 'hybrid', 'videomae_only', 'landmark_only'
-                 frame_info=None):  # List of (start_frame, end_frame) tuples
+                 frame_info=None,  # List of (start_frame, end_frame) tuples
+                 video_augment=None,  # VideoAugmentation object or callable
+                 landmark_augment=None):  # LandmarkAugmentation object or callable
 
         self.video_paths = video_paths
         self.labels = labels
@@ -536,6 +539,8 @@ class HybridASLDataset(torch.utils.data.Dataset):
         self.landmarks_dir = Path(landmarks_dir) if landmarks_dir else None
         self.mode = mode
         self.frame_info = frame_info  # (start_frame, end_frame) for each video
+        self.video_augment = video_augment
+        self.landmark_augment = landmark_augment
 
         # Validate mode requirements
         if mode in ['hybrid', 'videomae_only'] and videomae_processor is None:
@@ -649,6 +654,11 @@ class HybridASLDataset(torch.utils.data.Dataset):
         # Load video frames for VideoMAE (if needed)
         if self.mode in ['hybrid', 'videomae_only']:
             frames = self.load_video_frames(video_path, start_frame, end_frame)
+
+            # Apply video augmentation if provided
+            if self.video_augment is not None:
+                frames = self.video_augment(frames)
+
             pixel_values = self.videomae_processor(
                 list(frames),
                 return_tensors="pt"
@@ -661,6 +671,11 @@ class HybridASLDataset(torch.utils.data.Dataset):
         # Load landmarks (if needed)
         if self.mode in ['hybrid', 'landmark_only']:
             landmarks = self.load_landmarks(video_path)
+
+            # Apply landmark augmentation if provided
+            if self.landmark_augment is not None:
+                landmarks = self.landmark_augment(landmarks)
+
             result['landmarks'] = torch.tensor(landmarks, dtype=torch.float32)
         else:
             # Dummy tensor for videomae-only mode

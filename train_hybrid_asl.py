@@ -17,17 +17,18 @@ from hybrid_asl_model import (
     HybridASLTrainer,
     MediaPipeLandmarkExtractor
 )
+from augmentations import get_augmentations
 
 
 def download_mediapipe_models():
     """Download required MediaPipe task models."""
     import urllib.request
-    
+
     models = {
         'hand_landmarker.task': 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
         'pose_landmarker.task': 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task'
     }
-    
+
     for filename, url in models.items():
         if not Path(filename).exists():
             print(f"Downloading {filename}...")
@@ -38,12 +39,12 @@ def download_mediapipe_models():
 def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
     """
     Load WLASL dataset using flat video structure with JSON annotations.
-    
+
     Args:
         data_dir: Path to wlasl data directory (containing videos/ and JSON files)
         subset_file: Which subset to use ('nslt_100.json', 'nslt_300.json', etc.)
         split: Optional filter for 'train', 'val', or 'test'. None = all splits.
-    
+
     Returns:
         video_paths: List of video file paths
         labels: List of class indices
@@ -52,37 +53,37 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
     """
     data_dir = Path(data_dir)
     videos_dir = data_dir / 'videos'
-    
+
     # Load missing videos list for faster filtering (avoid filesystem checks)
     missing_videos = set()
     missing_path = data_dir / 'missing.txt'
     if missing_path.exists():
         with open(missing_path, 'r') as f:
             missing_videos = {line.strip() for line in f if line.strip()}
-    
+
     # Load subset config (video_id -> class mapping)
     subset_path = data_dir / subset_file
     if not subset_path.exists():
         raise FileNotFoundError(f"Subset file not found: {subset_path}")
-    
+
     with open(subset_path, 'r') as f:
         subset_data = json.load(f)
-    
+
     # Load main annotations (for gloss names)
     wlasl_path = data_dir / 'WLASL_v0.3.json'
     if not wlasl_path.exists():
         raise FileNotFoundError(f"WLASL annotations not found: {wlasl_path}")
-    
+
     with open(wlasl_path, 'r') as f:
         wlasl_data = json.load(f)
-    
+
     # Build video_id -> gloss mapping from WLASL_v0.3.json
     video_id_to_gloss = {}
     for entry in wlasl_data:
         gloss = entry['gloss']
         for instance in entry['instances']:
             video_id_to_gloss[instance['video_id']] = gloss
-    
+
     # Build class_idx -> gloss mapping (inferred from subset data)
     idx_to_gloss = {}
     for video_id, info in subset_data.items():
@@ -91,38 +92,38 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
             gloss = video_id_to_gloss[video_id]
             if class_idx not in idx_to_gloss:
                 idx_to_gloss[class_idx] = gloss
-    
+
     video_paths = []
     labels = []
     frame_info = []  # (start_frame, end_frame) for each video
     skipped = 0
-    
+
     for video_id, info in subset_data.items():
         # Filter by split if specified
         if split is not None and info['subset'] != split:
             continue
-        
+
         # Quick check: skip if in missing.txt
         if video_id in missing_videos:
             skipped += 1
             continue
-        
+
         video_path = videos_dir / f"{video_id}.mp4"
-        
+
         # Only include videos that exist
         if not video_path.exists():
             skipped += 1
             continue
-        
+
         # action format: [class_idx, start_frame, end_frame]
         class_idx = info['action'][0]
         start_frame = info['action'][1]
         end_frame = info['action'][2]
-        
+
         video_paths.append(str(video_path))
         labels.append(class_idx)
         frame_info.append((start_frame, end_frame))
-    
+
     print(f"Found {len(video_paths)} videos")
     print(f"Found {len(idx_to_gloss)} classes")
     if skipped > 0:
@@ -132,20 +133,22 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
     if split:
         print(f"Using split: {split}")
     print(f"Frame trimming: enabled (using start_frame/end_frame from annotations)")
-    
+
     # Save label mapping (idx -> gloss for inference)
     with open('label_mapping.json', 'w') as f:
         # Convert int keys to strings for JSON
         json.dump({str(k): v for k, v in idx_to_gloss.items()}, f, indent=2)
-    
+
     return video_paths, labels, idx_to_gloss, frame_info
 
 
 def main():
     parser = argparse.ArgumentParser(description='Train Hybrid ASL Model')
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to WLASL dataset')
+    parser.add_argument('--data_dir', type=str,
+                        required=True, help='Path to WLASL dataset')
     parser.add_argument('--subset', type=str, default='nslt_100.json',
-                        choices=['nslt_100.json', 'nslt_300.json', 'nslt_1000.json', 'nslt_2000.json'],
+                        choices=['nslt_100.json', 'nslt_300.json',
+                                 'nslt_1000.json', 'nslt_2000.json'],
                         help='Subset file to use (vocabulary size)')
     parser.add_argument('--split', type=str, default=None,
                         choices=['train', 'val', 'test'],
@@ -155,44 +158,52 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--num_frames', type=int, default=16)
     parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--fusion_type', type=str, default='concat', 
+    parser.add_argument('--fusion_type', type=str, default='concat',
                         choices=['concat', 'attention', 'gated'])
     parser.add_argument('--freeze_videomae', action='store_true')
     parser.add_argument('--device', type=str, default='cuda')
-    
+
     # New: Checkpoint and resume arguments
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
                         help='Directory to save checkpoints')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume training from')
-    
+
     # New: Landmark caching
     parser.add_argument('--landmarks_dir', type=str, default=None,
                         help='Directory with pre-extracted landmarks (.npy files)')
-    
+
     # New: Ablation mode
     parser.add_argument('--mode', type=str, default='hybrid',
                         choices=['hybrid', 'videomae_only', 'landmark_only'],
                         help='Training mode for ablation studies')
-    
+
+    # New: Data augmentation
+    parser.add_argument('--augment', action='store_true',
+                        help='Enable data augmentation to reduce overfitting')
+    parser.add_argument('--augment_strength', type=str, default='medium',
+                        choices=['light', 'medium', 'strong'],
+                        help='Augmentation strength level')
+
     args = parser.parse_args()
-    
+
     print("="*70)
     print("HYBRID ASL MODEL TRAINING")
     print("="*70)
     print()
-    
+
     # ─────────────────────────────────────────────────────────────────
     # 1. Download MediaPipe models (skip if using pre-extracted landmarks)
     # ─────────────────────────────────────────────────────────────────
-    need_mediapipe = args.mode in ['hybrid', 'landmark_only'] and not args.landmarks_dir
+    need_mediapipe = args.mode in [
+        'hybrid', 'landmark_only'] and not args.landmarks_dir
     if need_mediapipe:
         print("Step 1: Checking MediaPipe models...")
         download_mediapipe_models()
     else:
         print("Step 1: Skipping MediaPipe download (using pre-extracted landmarks)")
     print()
-    
+
     # ─────────────────────────────────────────────────────────────────
     # 2. Load dataset
     # ─────────────────────────────────────────────────────────────────
@@ -200,18 +211,18 @@ def main():
     print(f"  Subset: {args.subset}")
     print(f"  Split filter: {args.split or 'None (using random 80/20 split)'}")
     video_paths, labels, idx_to_gloss, frame_info = load_wlasl_dataset(
-        args.data_dir, 
+        args.data_dir,
         subset_file=args.subset,
         split=args.split
     )
     num_classes = len(idx_to_gloss)
     print()
-    
+
     # ─────────────────────────────────────────────────────────────────
     # 3. Initialize extractors and processors
     # ─────────────────────────────────────────────────────────────────
     print("Step 3: Initializing feature extractors...")
-    
+
     # Landmark extractor (only if needed and no cache)
     landmark_extractor = None
     if args.mode in ['hybrid', 'landmark_only'] and not args.landmarks_dir:
@@ -222,21 +233,37 @@ def main():
         print("✓ MediaPipe landmark extractor ready")
     elif args.landmarks_dir:
         print(f"✓ Using pre-extracted landmarks from: {args.landmarks_dir}")
-    
+
     # VideoMAE processor (only if needed)
     videomae_processor = None
     if args.mode in ['hybrid', 'videomae_only']:
-        videomae_processor = VideoMAEImageProcessor.from_pretrained('MCG-NJU/videomae-base')
+        videomae_processor = VideoMAEImageProcessor.from_pretrained(
+            'MCG-NJU/videomae-base')
         print("✓ VideoMAE processor ready")
-    
+
     print(f"✓ Training mode: {args.mode}")
     print()
-    
+
+    # ─────────────────────────────────────────────────────────────────
+    # 3b. Initialize augmentations (if enabled)
+    # ─────────────────────────────────────────────────────────────────
+    video_augment, landmark_augment = None, None
+    if args.augment:
+        video_augment, landmark_augment = get_augmentations(
+            enabled=True,
+            strength=args.augment_strength
+        )
+        print(
+            f"✓ Data augmentation: ENABLED (strength={args.augment_strength})")
+    else:
+        print("✓ Data augmentation: disabled")
+    print()
+
     # ─────────────────────────────────────────────────────────────────
     # 4. Create dataset and dataloaders
     # ─────────────────────────────────────────────────────────────────
     print("Step 4: Creating datasets...")
-    
+
     full_dataset = HybridASLDataset(
         video_paths=video_paths,
         labels=labels,
@@ -245,43 +272,45 @@ def main():
         num_frames=args.num_frames,
         landmarks_dir=args.landmarks_dir,
         mode=args.mode,
-        frame_info=frame_info  # Pass frame trimming info
+        frame_info=frame_info,  # Pass frame trimming info
+        video_augment=video_augment,  # Pass augmentation (None if disabled)
+        landmark_augment=landmark_augment
     )
-    
+
     # Split into train/val
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
-    
+
     train_dataset, val_dataset = random_split(
         full_dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
-    
+
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
+        train_dataset,
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True
     )
-    
+
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size, 
+        val_dataset,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True
     )
-    
+
     print(f"✓ Train samples: {len(train_dataset)}")
     print(f"✓ Val samples: {len(val_dataset)}")
     print()
-    
+
     # ─────────────────────────────────────────────────────────────────
     # 5. Create model
     # ─────────────────────────────────────────────────────────────────
     print("Step 5: Creating hybrid model...")
-    
+
     model = HybridASLModel(
         num_classes=num_classes,
         videomae_model='MCG-NJU/videomae-base',
@@ -290,22 +319,23 @@ def main():
         fusion_type=args.fusion_type,
         dropout=0.3
     )
-    
+
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+    trainable_params = sum(p.numel()
+                           for p in model.parameters() if p.requires_grad)
+
     print(f"✓ Total parameters: {total_params:,}")
     print(f"✓ Trainable parameters: {trainable_params:,}")
     print(f"✓ Fusion type: {args.fusion_type}")
     print()
-    
+
     # ─────────────────────────────────────────────────────────────────
     # 6. Train
     # ─────────────────────────────────────────────────────────────────
     print("Step 6: Starting training...")
     print("="*70)
     print()
-    
+
     trainer = HybridASLTrainer(
         model=model,
         train_loader=train_loader,
@@ -314,17 +344,17 @@ def main():
         learning_rate=args.learning_rate,
         checkpoint_dir=args.checkpoint_dir
     )
-    
+
     # Resume from checkpoint if specified
     if args.resume:
         trainer.load_checkpoint(args.resume)
-    
+
     best_acc = trainer.train(
         num_epochs=args.num_epochs,
         save_path='best_hybrid_asl_model.pth',
         checkpoint_every=5
     )
-    
+
     print("="*70)
     print("TRAINING COMPLETE!")
     print("="*70)
@@ -332,7 +362,7 @@ def main():
     print(f"Model saved to: best_hybrid_asl_model.pth")
     print(f"Checkpoints saved to: {args.checkpoint_dir}/")
     print(f"Label mapping saved to: label_mapping.json")
-    
+
     # Cleanup
     if landmark_extractor:
         landmark_extractor.close()
