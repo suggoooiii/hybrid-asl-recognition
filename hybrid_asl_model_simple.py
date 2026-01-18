@@ -31,6 +31,9 @@ from typing import Optional, Tuple
 # Import LandmarkEncoder from existing code
 from hybrid_asl_model import LandmarkEncoder
 
+# Default Gemma feature dimension (can be overridden)
+DEFAULT_GEMMA_FEATURE_DIM = 2048
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VISUAL PROJECTION (for pre-extracted Gemma features)
@@ -45,7 +48,7 @@ class VisualProjection(nn.Module):
     """
     
     def __init__(self,
-                 gemma_feature_dim: int = 2048,
+                 gemma_feature_dim: int = DEFAULT_GEMMA_FEATURE_DIM,
                  hidden_dim: int = 256,
                  dropout: float = 0.3):
         super().__init__()
@@ -131,7 +134,7 @@ class HybridASLModelSimple(nn.Module):
     
     def __init__(self,
                  num_classes: int,
-                 gemma_feature_dim: int = 2048,
+                 gemma_feature_dim: int = DEFAULT_GEMMA_FEATURE_DIM,
                  hidden_dim: int = 256,
                  dropout: float = 0.3,
                  fusion_type: str = 'concat'):
@@ -346,7 +349,7 @@ if __name__ == '__main__':
     # Create dummy model
     model = HybridASLModelSimple(
         num_classes=100,
-        gemma_feature_dim=2048,
+        gemma_feature_dim=DEFAULT_GEMMA_FEATURE_DIM,
         hidden_dim=256,
         fusion_type='concat'
     )
@@ -362,7 +365,7 @@ if __name__ == '__main__':
     # Test forward pass
     batch_size = 4
     num_frames = 16
-    gemma_dim = 2048
+    gemma_dim = DEFAULT_GEMMA_FEATURE_DIM
     
     gemma_features = torch.randn(batch_size, num_frames, gemma_dim)
     landmarks = torch.randn(batch_size, num_frames, 162)

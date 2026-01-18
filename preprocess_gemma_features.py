@@ -188,7 +188,7 @@ def main():
             success_count += 1
             
         except Exception as e:
-            print(f"\n  Error processing {video_id}: {e}")
+            print(f"\n  Error processing {video_id} ({type(e).__name__}): {e}")
             error_count += 1
             continue
     

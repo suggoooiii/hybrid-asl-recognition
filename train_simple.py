@@ -28,7 +28,7 @@ from pathlib import Path
 import json
 from tqdm import tqdm
 
-from hybrid_asl_model_simple import HybridASLModelSimple, PreextractedDataset
+from hybrid_asl_model_simple import HybridASLModelSimple, PreextractedDataset, DEFAULT_GEMMA_FEATURE_DIM
 
 
 def load_wlasl_metadata(data_dir, subset_file='nslt_100.json'):
@@ -250,10 +250,10 @@ def main():
     if gemma_metadata_path.exists():
         with open(gemma_metadata_path, 'r') as f:
             metadata = json.load(f)
-            gemma_feature_dim = metadata.get('feature_dim', 2048)
+            gemma_feature_dim = metadata.get('feature_dim', DEFAULT_GEMMA_FEATURE_DIM)
             print(f"✓ Detected Gemma feature dimension: {gemma_feature_dim}")
     else:
-        gemma_feature_dim = args.gemma_feature_dim or 2048
+        gemma_feature_dim = args.gemma_feature_dim or DEFAULT_GEMMA_FEATURE_DIM
         print(f"⚠ Using default Gemma feature dimension: {gemma_feature_dim}")
     
     print()
