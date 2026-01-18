@@ -42,9 +42,9 @@ class MediaPipeLandmarkExtractor:
         # Initialize MediaPipe Tasks API
         BaseOptions = mp.tasks.BaseOptions
         HandLandmarker = mp.tasks.vision.HandLandmarker
-        HandLandmarkerOptions = mp. tasks.vision.HandLandmarkerOptions
-        PoseLandmarker = mp. tasks.vision.PoseLandmarker
-        PoseLandmarkerOptions = mp.tasks. vision.PoseLandmarkerOptions
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        PoseLandmarker = mp.tasks.vision.PoseLandmarker
+        PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
         VisionRunningMode = mp.tasks.vision.RunningMode
         
         # Hand landmarker options
@@ -80,15 +80,15 @@ class MediaPipeLandmarkExtractor:
         hand_result = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
         
         # Detect pose
-        pose_result = self.pose_landmarker. detect_for_video(mp_image, timestamp_ms)
+        pose_result = self.pose_landmarker.detect_for_video(mp_image, timestamp_ms)
         
         features = []
         
         # ─────────────────────────────────────────────────────────────
         # LEFT HAND (63 features)
-        # ──────────────────────────────────────��──────────────────────
-        left_hand_features = [0. 0] * 63
-        for idx, handedness in enumerate(hand_result. handedness):
+        # ─────────────────────────────────────────────────────────────
+        left_hand_features = [0.0] * 63
+        for idx, handedness in enumerate(hand_result.handedness):
             if handedness[0].category_name == 'Left':
                 landmarks = hand_result.hand_landmarks[idx]
                 left_hand_features = []
@@ -111,15 +111,15 @@ class MediaPipeLandmarkExtractor:
         features.extend(right_hand_features)
         
         # ─────────────────────────────────────────────────────────────
-        # POSE - Upper body (36 features:  landmarks 11-22)
-        # ─────────────��───────────────────────────────────────────────
+        # POSE - Upper body (36 features: landmarks 11-22)
+        # ─────────────────────────────────────────────────────────────
         pose_features = [0.0] * 36
         if pose_result.pose_landmarks:
             pose_landmarks = pose_result.pose_landmarks[0]
             pose_features = []
             for i in range(11, 23):  # Shoulders, elbows, wrists, hips
                 lm = pose_landmarks[i]
-                pose_features. extend([lm.x, lm.y, lm.z])
+                pose_features.extend([lm.x, lm.y, lm.z])
         features.extend(pose_features)
         
         return np.array(features, dtype=np.float32)
@@ -156,9 +156,9 @@ class MediaPipeLandmarkExtractor:
         if len(frame_features) < max_frames:
             last_frame = frame_features[-1] if frame_features else np.zeros(self.feature_dim)
             while len(frame_features) < max_frames:
-                frame_features.append(last_frame. copy())
+                frame_features.append(last_frame.copy())
         
-        return np.array(frame_features[: max_frames], dtype=np. float32)
+        return np.array(frame_features[:max_frames], dtype=np.float32)
     
     def close(self):
         self.hand_landmarker.close()
@@ -194,7 +194,7 @@ class LandmarkEncoder(nn.Module):
         )
         
         # Positional encoding
-        self.pos_encoding = nn.Parameter(torch. randn(1, 64, hidden_dim) * 0.02)
+        self.pos_encoding = nn.Parameter(torch.randn(1, 64, hidden_dim) * 0.02)
         
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -234,7 +234,7 @@ class LandmarkEncoder(nn.Module):
         x = self.transformer(x)
         
         # Global average pooling
-        x = x. mean(dim=1)
+        x = x.mean(dim=1)
         
         # Output projection
         x = self.output_projection(x)
@@ -262,15 +262,15 @@ class VideoMAEEncoder(nn.Module):
         super().__init__()
         
         # Load pretrained VideoMAE
-        self.videomae = VideoMAEModel. from_pretrained(model_name)
+        self.videomae = VideoMAEModel.from_pretrained(model_name)
         
         # Optionally freeze backbone
-        if freeze_backbone: 
+        if freeze_backbone:
             for param in self.videomae.parameters():
-                param. requires_grad = False
+                param.requires_grad = False
         
         # Get VideoMAE hidden size
-        videomae_hidden = self.videomae.config. hidden_size  # Usually 768
+        videomae_hidden = self.videomae.config.hidden_size  # Usually 768
         
         # Project to our hidden dimension
         self.projection = nn.Sequential(
@@ -285,7 +285,7 @@ class VideoMAEEncoder(nn.Module):
     def forward(self, pixel_values):
         """
         Args:
-            pixel_values:  (batch, num_frames, channels, height, width)
+            pixel_values: (batch, num_frames, channels, height, width)
         Returns:
             (batch, hidden_dim) encoded features
         """
@@ -332,7 +332,7 @@ class HybridASLModel(nn.Module):
         # ─────────────────────────────────────────────────────────────
         # Stream 1: VideoMAE (Visual)
         # ─────────────────────────────────────────────────────────────
-        self. visual_encoder = VideoMAEEncoder(
+        self.visual_encoder = VideoMAEEncoder(
             model_name=videomae_model,
             hidden_dim=hidden_dim,
             freeze_backbone=freeze_videomae,
@@ -342,7 +342,7 @@ class HybridASLModel(nn.Module):
         # ─────────────────────────────────────────────────────────────
         # Stream 2: Landmark Encoder
         # ─────────────────────────────────────────────────────────────
-        self. landmark_encoder = LandmarkEncoder(
+        self.landmark_encoder = LandmarkEncoder(
             input_dim=162,
             hidden_dim=hidden_dim,
             num_heads=4,
@@ -353,15 +353,15 @@ class HybridASLModel(nn.Module):
         # ─────────────────────────────────────────────────────────────
         # Fusion Layer
         # ─────────────────────────────────────────────────────────────
-        if fusion_type == 'concat': 
+        if fusion_type == 'concat':
             fusion_input_dim = hidden_dim * 2
             self.fusion = nn.Sequential(
-                nn. Linear(fusion_input_dim, hidden_dim),
-                nn. LayerNorm(hidden_dim),
+                nn.Linear(fusion_input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout)
             )
-        elif fusion_type == 'attention': 
+        elif fusion_type == 'attention':
             self.fusion_attention = nn.MultiheadAttention(
                 embed_dim=hidden_dim,
                 num_heads=4,
@@ -377,7 +377,7 @@ class HybridASLModel(nn.Module):
         elif fusion_type == 'gated':
             self.gate = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
-                nn. Sigmoid()
+                nn.Sigmoid()
             )
             self.fusion = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
@@ -389,7 +389,7 @@ class HybridASLModel(nn.Module):
         # ─────────────────────────────────────────────────────────────
         # Classifier Head
         # ─────────────────────────────────────────────────────────────
-        self. classifier = nn.Sequential(
+        self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -407,8 +407,8 @@ class HybridASLModel(nn.Module):
             logits: (batch, num_classes)
         """
         # Encode both streams
-        visual_features = self. visual_encoder(pixel_values)    # (B, hidden)
-        landmark_features = self. landmark_encoder(landmarks)    # (B, hidden)
+        visual_features = self.visual_encoder(pixel_values)    # (B, hidden)
+        landmark_features = self.landmark_encoder(landmarks)    # (B, hidden)
         
         # Fusion
         if self.fusion_type == 'concat':
@@ -423,8 +423,8 @@ class HybridASLModel(nn.Module):
             attended_v, _ = self.fusion_attention(v_expanded, l_expanded, l_expanded)
             attended_l, _ = self.fusion_attention(l_expanded, v_expanded, v_expanded)
             
-            fused = torch.cat([attended_v. squeeze(1), attended_l.squeeze(1)], dim=-1)
-            fused = self. fusion(fused)
+            fused = torch.cat([attended_v.squeeze(1), attended_l.squeeze(1)], dim=-1)
+            fused = self.fusion(fused)
             
         elif self.fusion_type == 'gated':
             combined = torch.cat([visual_features, landmark_features], dim=-1)
@@ -451,17 +451,23 @@ class HybridASLModel(nn.Module):
 
 class HybridASLDataset(torch.utils.data.Dataset):
     """
-    Dataset for hybrid ASL model. 
+    Dataset for hybrid ASL model.
     Loads both video frames (for VideoMAE) and landmarks (for transformer).
+    
+    Supports pre-extracted landmarks for 10-50x faster training:
+        - If landmarks_dir is provided, loads {video_id}_landmarks.npy
+        - Otherwise, extracts landmarks on-the-fly using landmark_extractor
     """
     
     def __init__(self, 
                  video_paths,
                  labels,
-                 landmark_extractor,
-                 videomae_processor,
+                 landmark_extractor=None,
+                 videomae_processor=None,
                  num_frames=16,
-                 image_size=224):
+                 image_size=224,
+                 landmarks_dir=None,
+                 mode='hybrid'):  # 'hybrid', 'videomae_only', 'landmark_only'
         
         self.video_paths = video_paths
         self.labels = labels
@@ -469,6 +475,25 @@ class HybridASLDataset(torch.utils.data.Dataset):
         self.videomae_processor = videomae_processor
         self.num_frames = num_frames
         self.image_size = image_size
+        self.landmarks_dir = Path(landmarks_dir) if landmarks_dir else None
+        self.mode = mode
+        
+        # Validate mode requirements
+        if mode in ['hybrid', 'videomae_only'] and videomae_processor is None:
+            raise ValueError(f"videomae_processor required for mode='{mode}'")
+        if mode in ['hybrid', 'landmark_only']:
+            if landmarks_dir is None and landmark_extractor is None:
+                raise ValueError(f"Either landmarks_dir or landmark_extractor required for mode='{mode}'")
+        
+        # Pre-check which landmarks are available
+        if self.landmarks_dir:
+            self.cached_landmarks = {}
+            for vp in video_paths:
+                video_id = Path(vp).stem
+                landmark_path = self.landmarks_dir / f"{video_id}_landmarks.npy"
+                if landmark_path.exists():
+                    self.cached_landmarks[video_id] = str(landmark_path)
+            print(f"  Found {len(self.cached_landmarks)}/{len(video_paths)} pre-extracted landmarks")
         
     def __len__(self):
         return len(self.video_paths)
@@ -486,54 +511,82 @@ class HybridASLDataset(torch.utils.data.Dataset):
         else:
             indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
         
-        for idx in indices: 
+        for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if ret:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames. append(frame_rgb)
+                frames.append(frame_rgb)
         
         cap.release()
         
         # Pad if needed
         while len(frames) < self.num_frames:
-            frames.append(frames[-1] if frames else np.zeros((self.image_size, self. image_size, 3), dtype=np.uint8))
+            frames.append(frames[-1] if frames else np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8))
         
-        return frames[: self.num_frames]
+        return frames[:self.num_frames]
+    
+    def load_landmarks(self, video_path):
+        """Load landmarks from cache or extract on-the-fly."""
+        video_id = Path(video_path).stem
+        
+        # Try to load from cache
+        if self.landmarks_dir and video_id in self.cached_landmarks:
+            landmarks = np.load(self.cached_landmarks[video_id])
+            # Ensure correct shape
+            if len(landmarks) < self.num_frames:
+                # Pad with last frame
+                padding = np.tile(landmarks[-1:], (self.num_frames - len(landmarks), 1))
+                landmarks = np.vstack([landmarks, padding])
+            return landmarks[:self.num_frames]
+        
+        # Extract on-the-fly
+        if self.landmark_extractor:
+            return self.landmark_extractor.extract_video_landmarks(
+                video_path, 
+                max_frames=self.num_frames
+            )
+        
+        # Return zeros if no extractor (shouldn't happen with proper validation)
+        return np.zeros((self.num_frames, 162), dtype=np.float32)
     
     def __getitem__(self, idx):
         video_path = self.video_paths[idx]
         label = self.labels[idx]
         
-        # Load video frames for VideoMAE
-        frames = self.load_video_frames(video_path)
-        
-        # Process for VideoMAE
-        pixel_values = self.videomae_processor(
-            list(frames), 
-            return_tensors="pt"
-        ).pixel_values.squeeze(0)
-        
-        # Extract landmarks
-        landmarks = self.landmark_extractor. extract_video_landmarks(
-            video_path, 
-            max_frames=self.num_frames
-        )
-        landmarks = torch.tensor(landmarks, dtype=torch.float32)
-        
-        return {
-            'pixel_values': pixel_values,
-            'landmarks': landmarks,
+        result = {
             'label': torch.tensor(label, dtype=torch.long)
         }
+        
+        # Load video frames for VideoMAE (if needed)
+        if self.mode in ['hybrid', 'videomae_only']:
+            frames = self.load_video_frames(video_path)
+            pixel_values = self.videomae_processor(
+                list(frames), 
+                return_tensors="pt"
+            ).pixel_values.squeeze(0)
+            result['pixel_values'] = pixel_values
+        else:
+            # Dummy tensor for landmark-only mode
+            result['pixel_values'] = torch.zeros(self.num_frames, 3, 224, 224)
+        
+        # Load landmarks (if needed)
+        if self.mode in ['hybrid', 'landmark_only']:
+            landmarks = self.load_landmarks(video_path)
+            result['landmarks'] = torch.tensor(landmarks, dtype=torch.float32)
+        else:
+            # Dummy tensor for videomae-only mode
+            result['landmarks'] = torch.zeros(self.num_frames, 162)
+        
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRAINING UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class HybridASLTrainer: 
-    """Training manager for the hybrid model."""
+class HybridASLTrainer:
+    """Training manager for the hybrid model with checkpoint support."""
     
     def __init__(self, 
                  model, 
@@ -541,12 +594,15 @@ class HybridASLTrainer:
                  val_loader,
                  device='cuda',
                  learning_rate=1e-4,
-                 weight_decay=0.01):
+                 weight_decay=0.01,
+                 checkpoint_dir='checkpoints'):
         
-        self.model = model. to(device)
+        self.model = model.to(device)
         self.device = device
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Optimizer with different learning rates
         # Lower LR for pretrained VideoMAE, higher for new layers
@@ -554,7 +610,7 @@ class HybridASLTrainer:
         other_params = [p for n, p in model.named_parameters() 
                        if 'videomae' not in n]
         
-        self.optimizer = torch.optim. AdamW([
+        self.optimizer = torch.optim.AdamW([
             {'params': videomae_params, 'lr': learning_rate * 0.1},
             {'params': other_params, 'lr': learning_rate}
         ], weight_decay=weight_decay)
@@ -564,6 +620,42 @@ class HybridASLTrainer:
         )
         
         self.criterion = nn.CrossEntropyLoss()
+        
+        # Track training state
+        self.start_epoch = 0
+        self.best_val_acc = 0
+    
+    def save_checkpoint(self, epoch, val_acc, filename=None):
+        """Save training checkpoint."""
+        if filename is None:
+            filename = f'checkpoint_epoch_{epoch+1}.pth'
+        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_acc': self.best_val_acc,
+            'val_acc': val_acc,
+        }
+        
+        checkpoint_path = self.checkpoint_dir / filename
+        torch.save(checkpoint, checkpoint_path)
+        return checkpoint_path
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load training checkpoint and resume training."""
+        print(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.best_val_acc = checkpoint['best_val_acc']
+        
+        print(f"✓ Resumed from epoch {self.start_epoch}, best val acc: {self.best_val_acc:.2f}%")
+        return self.start_epoch
         
     def train_epoch(self):
         self.model.train()
@@ -585,52 +677,76 @@ class HybridASLTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             
-            total_loss += loss. item()
+            total_loss += loss.item()
             _, predicted = logits.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
         
-        return total_loss / len(self. train_loader), 100. * correct / total
+        return total_loss / len(self.train_loader), 100. * correct / total
     
     @torch.no_grad()
     def evaluate(self):
         self.model.eval()
         total_loss = 0
         correct = 0
+        correct_top5 = 0
         total = 0
         
         for batch in self.val_loader:
-            pixel_values = batch['pixel_values'].to(self. device)
+            pixel_values = batch['pixel_values'].to(self.device)
             landmarks = batch['landmarks'].to(self.device)
-            labels = batch['label']. to(self.device)
+            labels = batch['label'].to(self.device)
             
             logits = self.model(pixel_values, landmarks)
             loss = self.criterion(logits, labels)
             
             total_loss += loss.item()
-            _, predicted = logits. max(1)
+            
+            # Top-1 accuracy
+            _, predicted = logits.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
+            
+            # Top-5 accuracy
+            _, top5_pred = logits.topk(5, dim=1)
+            correct_top5 += sum(labels[i] in top5_pred[i] for i in range(labels.size(0)))
         
-        return total_loss / len(self.val_loader), 100. * correct / total
+        top1_acc = 100. * correct / total
+        top5_acc = 100. * correct_top5 / total
+        return total_loss / len(self.val_loader), top1_acc, top5_acc
     
-    def train(self, num_epochs, save_path='hybrid_asl_model.pth'):
-        best_val_acc = 0
+    def train(self, num_epochs, save_path='hybrid_asl_model.pth', checkpoint_every=5):
+        """
+        Train the model with checkpoint support.
         
-        for epoch in range(num_epochs):
+        Args:
+            num_epochs: Total number of epochs to train
+            save_path: Path to save the best model
+            checkpoint_every: Save checkpoint every N epochs
+        """
+        for epoch in range(self.start_epoch, num_epochs):
             train_loss, train_acc = self.train_epoch()
-            val_loss, val_acc = self.evaluate()
+            val_loss, val_acc, val_top5 = self.evaluate()
             self.scheduler.step()
             
             print(f"Epoch {epoch+1}/{num_epochs}")
             print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+            print(f"  Val Loss: {val_loss:.4f}, Val Top-1: {val_acc:.2f}%, Val Top-5: {val_top5:.2f}%")
             
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(self.model. state_dict(), save_path)
-                print(f"  ✓ New best model saved!  ({val_acc:.2f}%)")
+            # Save best model
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                torch.save(self.model.state_dict(), save_path)
+                print(f"  ✓ New best model saved! ({val_acc:.2f}%)")
+            
+            # Save periodic checkpoint
+            if (epoch + 1) % checkpoint_every == 0:
+                ckpt_path = self.save_checkpoint(epoch, val_acc)
+                print(f"  ✓ Checkpoint saved: {ckpt_path}")
             
             print()
         
-        return best_val_acc
+        # Save final checkpoint
+        self.save_checkpoint(num_epochs - 1, val_acc, 'checkpoint_final.pth')
+        
+        return self.best_val_acc

@@ -19,7 +19,7 @@ class HybridASLWebcam:
     """Real-time ASL recognition using hybrid model."""
     
     def __init__(self,
-                 model_path='best_hybrid_asl_model. pth',
+                 model_path='best_hybrid_asl_model.pth',
                  label_mapping_path='label_mapping.json',
                  num_frames=16,
                  device='cuda'):
@@ -29,11 +29,11 @@ class HybridASLWebcam:
         self.device = device
         self.num_frames = num_frames
         
-        # Load label mapping
+        # Load label mapping (already maps idx -> gloss, convert keys to int)
         with open(label_mapping_path, 'r') as f:
-            label_to_idx = json.load(f)
-        self.idx_to_label = {v:  k for k, v in label_to_idx.items()}
-        num_classes = len(label_to_idx)
+            label_mapping = json.load(f)
+        self.idx_to_label = {int(k): v for k, v in label_mapping.items()}
+        num_classes = len(label_mapping)
         
         # Load model
         self.model = HybridASLModel(
@@ -49,7 +49,7 @@ class HybridASLWebcam:
         
         # Initialize extractors
         self.landmark_extractor = MediaPipeLandmarkExtractor()
-        self.videomae_processor = VideoMAEImageProcessor. from_pretrained('MCG-NJU/videomae-base')
+        self.videomae_processor = VideoMAEImageProcessor.from_pretrained('MCG-NJU/videomae-base')
         print("✓ Feature extractors ready")
         
         # Frame buffers
@@ -68,7 +68,7 @@ class HybridASLWebcam:
         """Process a single frame and add to buffers."""
         
         # Store frame for VideoMAE
-        self.frame_buffer.append(frame_rgb. copy())
+        self.frame_buffer.append(frame_rgb.copy())
         
         # Extract landmarks
         landmarks = self.landmark_extractor.extract_frame_landmarks(
@@ -94,12 +94,12 @@ class HybridASLWebcam:
         landmarks = torch.tensor(landmarks, dtype=torch.float32).unsqueeze(0).to(self.device)
         
         # Predict
-        predictions, confidence, probs = self.model. predict(pixel_values, landmarks)
+        predictions, confidence, probs = self.model.predict(pixel_values, landmarks)
         
         pred_idx = predictions[0].item()
         conf = confidence[0].item()
         
-        word = self.idx_to_label. get(pred_idx, "Unknown")
+        word = self.idx_to_label.get(pred_idx, "Unknown")
         
         return word, conf
     
@@ -122,7 +122,7 @@ class HybridASLWebcam:
                    0.5, (255, 255, 255), 1)
         
         buffer_pct = len(self.frame_buffer) / self.num_frames * 100
-        cv2.putText(frame, f"Buffer:  {len(self.frame_buffer)}/{self.num_frames} ({buffer_pct:.0f}%)", 
+        cv2.putText(frame, f"Buffer: {len(self.frame_buffer)}/{self.num_frames} ({buffer_pct:.0f}%)", 
                    (150, 70), cv2.FONT_HERSHEY_SIMPLEX, 
                    0.5, (255, 255, 255), 1)
         
@@ -143,7 +143,7 @@ class HybridASLWebcam:
                        (w-100, 145), cv2.FONT_HERSHEY_SIMPLEX, 
                        0.7, (0, 255, 0), 2)
         else:
-            cv2.putText(frame, "Collecting frames...  Make a sign!", 
+            cv2.putText(frame, "Collecting frames... Make a sign!", 
                        (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 
                        0.6, (200, 200, 200), 1)
         
@@ -230,7 +230,7 @@ class HybridASLWebcam:
                     break
                 elif key == ord('r'):
                     self.frame_buffer.clear()
-                    self.landmark_buffer. clear()
+                    self.landmark_buffer.clear()
                     self.current_prediction = None
                     self.confidence = 0.0
                     print("✓ Buffers reset")

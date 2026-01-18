@@ -24,7 +24,7 @@ def download_mediapipe_models():
     import urllib.request
     
     models = {
-        'hand_landmarker. task': 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        'hand_landmarker.task': 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
         'pose_landmarker.task': 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task'
     }
     
@@ -139,6 +139,21 @@ def main():
     parser.add_argument('--freeze_videomae', action='store_true')
     parser.add_argument('--device', type=str, default='cuda')
     
+    # New: Checkpoint and resume arguments
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory to save checkpoints')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume training from')
+    
+    # New: Landmark caching
+    parser.add_argument('--landmarks_dir', type=str, default=None,
+                        help='Directory with pre-extracted landmarks (.npy files)')
+    
+    # New: Ablation mode
+    parser.add_argument('--mode', type=str, default='hybrid',
+                        choices=['hybrid', 'videomae_only', 'landmark_only'],
+                        help='Training mode for ablation studies')
+    
     args = parser.parse_args()
     
     print("="*70)
@@ -147,10 +162,14 @@ def main():
     print()
     
     # ─────────────────────────────────────────────────────────────────
-    # 1. Download MediaPipe models
+    # 1. Download MediaPipe models (skip if using pre-extracted landmarks)
     # ─────────────────────────────────────────────────────────────────
-    print("Step 1: Checking MediaPipe models...")
-    download_mediapipe_models()
+    need_mediapipe = args.mode in ['hybrid', 'landmark_only'] and not args.landmarks_dir
+    if need_mediapipe:
+        print("Step 1: Checking MediaPipe models...")
+        download_mediapipe_models()
+    else:
+        print("Step 1: Skipping MediaPipe download (using pre-extracted landmarks)")
     print()
     
     # ─────────────────────────────────────────────────────────────────
@@ -172,15 +191,24 @@ def main():
     # ─────────────────────────────────────────────────────────────────
     print("Step 3: Initializing feature extractors...")
     
-    landmark_extractor = MediaPipeLandmarkExtractor(
-        hand_model_path='hand_landmarker.task',
-        pose_model_path='pose_landmarker. task'
-    )
+    # Landmark extractor (only if needed and no cache)
+    landmark_extractor = None
+    if args.mode in ['hybrid', 'landmark_only'] and not args.landmarks_dir:
+        landmark_extractor = MediaPipeLandmarkExtractor(
+            hand_model_path='hand_landmarker.task',
+            pose_model_path='pose_landmarker.task'
+        )
+        print("✓ MediaPipe landmark extractor ready")
+    elif args.landmarks_dir:
+        print(f"✓ Using pre-extracted landmarks from: {args.landmarks_dir}")
     
-    videomae_processor = VideoMAEImageProcessor. from_pretrained('MCG-NJU/videomae-base')
+    # VideoMAE processor (only if needed)
+    videomae_processor = None
+    if args.mode in ['hybrid', 'videomae_only']:
+        videomae_processor = VideoMAEImageProcessor.from_pretrained('MCG-NJU/videomae-base')
+        print("✓ VideoMAE processor ready")
     
-    print("✓ MediaPipe landmark extractor ready")
-    print("✓ VideoMAE processor ready")
+    print(f"✓ Training mode: {args.mode}")
     print()
     
     # ─────────────────────────────────────────────────────────────────
@@ -193,7 +221,9 @@ def main():
         labels=labels,
         landmark_extractor=landmark_extractor,
         videomae_processor=videomae_processor,
-        num_frames=args.num_frames
+        num_frames=args.num_frames,
+        landmarks_dir=args.landmarks_dir,
+        mode=args.mode
     )
     
     # Split into train/val
@@ -240,7 +270,7 @@ def main():
     )
     
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p. numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     print(f"✓ Total parameters: {total_params:,}")
     print(f"✓ Trainable parameters: {trainable_params:,}")
@@ -259,23 +289,31 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         device=args.device,
-        learning_rate=args.learning_rate
+        learning_rate=args.learning_rate,
+        checkpoint_dir=args.checkpoint_dir
     )
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
     
     best_acc = trainer.train(
         num_epochs=args.num_epochs,
-        save_path='best_hybrid_asl_model. pth'
+        save_path='best_hybrid_asl_model.pth',
+        checkpoint_every=5
     )
     
     print("="*70)
     print("TRAINING COMPLETE!")
     print("="*70)
     print(f"Best validation accuracy: {best_acc:.2f}%")
-    print(f"Model saved to: best_hybrid_asl_model. pth")
-    print(f"Label mapping saved to: label_mapping. json")
+    print(f"Model saved to: best_hybrid_asl_model.pth")
+    print(f"Checkpoints saved to: {args.checkpoint_dir}/")
+    print(f"Label mapping saved to: label_mapping.json")
     
     # Cleanup
-    landmark_extractor.close()
+    if landmark_extractor:
+        landmark_extractor.close()
 
 
 if __name__ == "__main__":
