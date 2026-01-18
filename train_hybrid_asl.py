@@ -48,9 +48,17 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
         video_paths: List of video file paths
         labels: List of class indices
         idx_to_gloss: Dict mapping class index to gloss name
+        frame_info: List of (start_frame, end_frame) tuples for trimming
     """
     data_dir = Path(data_dir)
     videos_dir = data_dir / 'videos'
+    
+    # Load missing videos list for faster filtering (avoid filesystem checks)
+    missing_videos = set()
+    missing_path = data_dir / 'missing.txt'
+    if missing_path.exists():
+        with open(missing_path, 'r') as f:
+            missing_videos = {line.strip() for line in f if line.strip()}
     
     # Load subset config (video_id -> class mapping)
     subset_path = data_dir / subset_file
@@ -86,11 +94,17 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
     
     video_paths = []
     labels = []
+    frame_info = []  # (start_frame, end_frame) for each video
     skipped = 0
     
     for video_id, info in subset_data.items():
         # Filter by split if specified
         if split is not None and info['subset'] != split:
+            continue
+        
+        # Quick check: skip if in missing.txt
+        if video_id in missing_videos:
+            skipped += 1
             continue
         
         video_path = videos_dir / f"{video_id}.mp4"
@@ -100,24 +114,31 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
             skipped += 1
             continue
         
+        # action format: [class_idx, start_frame, end_frame]
         class_idx = info['action'][0]
+        start_frame = info['action'][1]
+        end_frame = info['action'][2]
         
         video_paths.append(str(video_path))
         labels.append(class_idx)
+        frame_info.append((start_frame, end_frame))
     
     print(f"Found {len(video_paths)} videos")
     print(f"Found {len(idx_to_gloss)} classes")
     if skipped > 0:
         print(f"Skipped {skipped} missing videos")
+    if missing_videos:
+        print(f"  (using missing.txt with {len(missing_videos)} entries)")
     if split:
         print(f"Using split: {split}")
+    print(f"Frame trimming: enabled (using start_frame/end_frame from annotations)")
     
     # Save label mapping (idx -> gloss for inference)
     with open('label_mapping.json', 'w') as f:
         # Convert int keys to strings for JSON
         json.dump({str(k): v for k, v in idx_to_gloss.items()}, f, indent=2)
     
-    return video_paths, labels, idx_to_gloss
+    return video_paths, labels, idx_to_gloss, frame_info
 
 
 def main():
@@ -178,7 +199,7 @@ def main():
     print("Step 2: Loading WLASL dataset...")
     print(f"  Subset: {args.subset}")
     print(f"  Split filter: {args.split or 'None (using random 80/20 split)'}")
-    video_paths, labels, idx_to_gloss = load_wlasl_dataset(
+    video_paths, labels, idx_to_gloss, frame_info = load_wlasl_dataset(
         args.data_dir, 
         subset_file=args.subset,
         split=args.split
@@ -223,7 +244,8 @@ def main():
         videomae_processor=videomae_processor,
         num_frames=args.num_frames,
         landmarks_dir=args.landmarks_dir,
-        mode=args.mode
+        mode=args.mode,
+        frame_info=frame_info  # Pass frame trimming info
     )
     
     # Split into train/val

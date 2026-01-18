@@ -124,31 +124,57 @@ class MediaPipeLandmarkExtractor:
         
         return np.array(features, dtype=np.float32)
     
-    def extract_video_landmarks(self, video_path, max_frames=16):
-        """Extract landmarks from entire video."""
+    def extract_video_landmarks(self, video_path, max_frames=16, start_frame=None, end_frame=None):
+        """
+        Extract landmarks from entire video with optional frame trimming.
+        
+        Args:
+            video_path: Path to video file
+            max_frames: Number of frames to extract
+            start_frame: First frame to include (1-indexed as per WLASL annotations)
+            end_frame: Last frame to include (1-indexed, inclusive)
+        """
         
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Apply frame trimming if specified (convert 1-indexed to 0-indexed)
+        if start_frame is not None and end_frame is not None:
+            frame_start = max(0, start_frame - 1)
+            frame_end = min(total_frames - 1, end_frame - 1)
+            segment_length = frame_end - frame_start + 1
+        else:
+            frame_start = 0
+            frame_end = total_frames - 1
+            segment_length = total_frames
+        
+        # Calculate which frames to sample (uniform sampling within segment)
+        if segment_length <= max_frames:
+            sample_indices = [frame_start + i for i in range(segment_length)]
+        else:
+            sample_indices = np.linspace(frame_start, frame_end, max_frames, dtype=int).tolist()
         
         frame_features = []
-        frame_idx = 0
         
-        while cap.isOpened() and len(frame_features) < max_frames:
+        for frame_idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
-                break
+                # Pad with zeros if frame read fails
+                frame_features.append(np.zeros(self.feature_dim, dtype=np.float32))
+                continue
             
             # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Calculate timestamp
-            timestamp_ms = int(frame_idx * 1000 / fps)
+            # Calculate timestamp (relative to segment start for consistent tracking)
+            relative_idx = frame_idx - frame_start
+            timestamp_ms = int(relative_idx * 1000 / fps)
             
             # Extract landmarks
             features = self.extract_frame_landmarks(frame_rgb, timestamp_ms)
             frame_features.append(features)
-            
-            frame_idx += 1
         
         cap.release()
         
@@ -454,9 +480,11 @@ class HybridASLDataset(torch.utils.data.Dataset):
     Dataset for hybrid ASL model.
     Loads both video frames (for VideoMAE) and landmarks (for transformer).
     
-    Supports pre-extracted landmarks for 10-50x faster training:
-        - If landmarks_dir is provided, loads {video_id}_landmarks.npy
-        - Otherwise, extracts landmarks on-the-fly using landmark_extractor
+    Supports:
+        - Frame trimming using start_frame/end_frame from WLASL annotations
+        - Pre-extracted landmarks for 10-50x faster training:
+            - If landmarks_dir is provided, loads {video_id}_landmarks.npy
+            - Otherwise, extracts landmarks on-the-fly using landmark_extractor
     """
     
     def __init__(self, 
@@ -467,7 +495,8 @@ class HybridASLDataset(torch.utils.data.Dataset):
                  num_frames=16,
                  image_size=224,
                  landmarks_dir=None,
-                 mode='hybrid'):  # 'hybrid', 'videomae_only', 'landmark_only'
+                 mode='hybrid',  # 'hybrid', 'videomae_only', 'landmark_only'
+                 frame_info=None):  # List of (start_frame, end_frame) tuples
         
         self.video_paths = video_paths
         self.labels = labels
@@ -477,6 +506,7 @@ class HybridASLDataset(torch.utils.data.Dataset):
         self.image_size = image_size
         self.landmarks_dir = Path(landmarks_dir) if landmarks_dir else None
         self.mode = mode
+        self.frame_info = frame_info  # (start_frame, end_frame) for each video
         
         # Validate mode requirements
         if mode in ['hybrid', 'videomae_only'] and videomae_processor is None:
@@ -498,18 +528,36 @@ class HybridASLDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.video_paths)
     
-    def load_video_frames(self, video_path):
-        """Load and preprocess video frames for VideoMAE."""
+    def load_video_frames(self, video_path, start_frame=None, end_frame=None):
+        """
+        Load and preprocess video frames for VideoMAE.
+        
+        Args:
+            video_path: Path to video file
+            start_frame: First frame to include (1-indexed as per WLASL annotations)
+            end_frame: Last frame to include (1-indexed, inclusive)
+        """
         cap = cv2.VideoCapture(str(video_path))
         frames = []
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Sample frames uniformly
-        if total_frames <= self.num_frames:
-            indices = list(range(total_frames))
+        # Apply frame trimming if specified (convert 1-indexed to 0-indexed)
+        if start_frame is not None and end_frame is not None:
+            # WLASL uses 1-indexed frames, convert to 0-indexed
+            frame_start = max(0, start_frame - 1)
+            frame_end = min(total_frames - 1, end_frame - 1)
+            segment_length = frame_end - frame_start + 1
         else:
-            indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+            frame_start = 0
+            frame_end = total_frames - 1
+            segment_length = total_frames
+        
+        # Sample frames uniformly within the trimmed segment
+        if segment_length <= self.num_frames:
+            indices = [frame_start + i for i in range(segment_length)]
+        else:
+            indices = np.linspace(frame_start, frame_end, self.num_frames, dtype=int).tolist()
         
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -554,13 +602,18 @@ class HybridASLDataset(torch.utils.data.Dataset):
         video_path = self.video_paths[idx]
         label = self.labels[idx]
         
+        # Get frame trimming info if available
+        start_frame, end_frame = None, None
+        if self.frame_info is not None:
+            start_frame, end_frame = self.frame_info[idx]
+        
         result = {
             'label': torch.tensor(label, dtype=torch.long)
         }
         
         # Load video frames for VideoMAE (if needed)
         if self.mode in ['hybrid', 'videomae_only']:
-            frames = self.load_video_frames(video_path)
+            frames = self.load_video_frames(video_path, start_frame, end_frame)
             pixel_values = self.videomae_processor(
                 list(frames), 
                 return_tensors="pt"

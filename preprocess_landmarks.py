@@ -67,9 +67,20 @@ def main():
     print(f"  Videos directory: {videos_dir}")
     print(f"  Output directory: {output_dir}")
     
-    # Get video list
+    # Load missing videos for faster filtering
+    missing_videos = set()
+    missing_path = data_dir / 'missing.txt'
+    if missing_path.exists():
+        with open(missing_path, 'r') as f:
+            missing_videos = {line.strip() for line in f if line.strip()}
+        print(f"  Loaded {len(missing_videos)} entries from missing.txt")
+    
+    # Get video list with frame info
+    video_paths = []
+    frame_info = {}  # video_id -> (start_frame, end_frame)
+    
     if args.subset:
-        # Load subset file to get specific video IDs
+        # Load subset file to get specific video IDs and frame info
         subset_path = data_dir / args.subset
         if not subset_path.exists():
             raise FileNotFoundError(f"Subset file not found: {subset_path}")
@@ -77,16 +88,23 @@ def main():
         with open(subset_path, 'r') as f:
             subset_data = json.load(f)
         
-        video_paths = []
-        for video_id in subset_data.keys():
+        for video_id, info in subset_data.items():
+            # Skip if in missing.txt
+            if video_id in missing_videos:
+                continue
+                
             video_path = videos_dir / f"{video_id}.mp4"
             if video_path.exists():
                 video_paths.append(video_path)
+                # action format: [class_idx, start_frame, end_frame]
+                frame_info[video_id] = (info['action'][1], info['action'][2])
         
         print(f"  Using subset: {args.subset}")
+        print(f"  Frame trimming: ENABLED (using start_frame/end_frame from annotations)")
     else:
-        # Get all videos in directory
+        # Get all videos in directory (no frame trimming available)
         video_paths = list(videos_dir.glob('*.mp4'))
+        print(f"  Frame trimming: DISABLED (no subset file specified)")
     
     print(f"  Found {len(video_paths)} videos")
     
@@ -123,10 +141,18 @@ def main():
     
     for video_path in tqdm(video_paths, desc="Processing videos"):
         try:
-            # Extract landmarks
+            # Get frame info if available
+            video_id = video_path.stem
+            start_frame, end_frame = None, None
+            if video_id in frame_info:
+                start_frame, end_frame = frame_info[video_id]
+            
+            # Extract landmarks with frame trimming
             landmarks = extractor.extract_video_landmarks(
                 video_path, 
-                max_frames=args.num_frames
+                max_frames=args.num_frames,
+                start_frame=start_frame,
+                end_frame=end_frame
             )
             
             # Save as .npy

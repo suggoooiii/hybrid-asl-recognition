@@ -43,9 +43,16 @@ def download_mediapipe_models():
 
 
 def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split='test'):
-    """Load WLASL dataset for specific split."""
+    """Load WLASL dataset for specific split with frame trimming info."""
     data_dir = Path(data_dir)
     videos_dir = data_dir / 'videos'
+    
+    # Load missing videos list for faster filtering
+    missing_videos = set()
+    missing_path = data_dir / 'missing.txt'
+    if missing_path.exists():
+        with open(missing_path, 'r') as f:
+            missing_videos = {line.strip() for line in f if line.strip()}
     
     with open(data_dir / subset_file, 'r') as f:
         subset_data = json.load(f)
@@ -69,10 +76,16 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split='test'):
     
     video_paths = []
     labels = []
+    frame_info = []  # (start_frame, end_frame) for each video
     skipped = 0
     
     for video_id, info in subset_data.items():
         if split is not None and info['subset'] != split:
+            continue
+        
+        # Quick check: skip if in missing.txt
+        if video_id in missing_videos:
+            skipped += 1
             continue
         
         video_path = videos_dir / f"{video_id}.mp4"
@@ -80,14 +93,17 @@ def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split='test'):
             skipped += 1
             continue
         
+        # action format: [class_idx, start_frame, end_frame]
         video_paths.append(str(video_path))
         labels.append(info['action'][0])
+        frame_info.append((info['action'][1], info['action'][2]))
     
     print(f"Loaded {len(video_paths)} videos for split '{split}'")
     if skipped > 0:
         print(f"Skipped {skipped} missing videos")
+    print(f"Frame trimming: enabled")
     
-    return video_paths, labels, idx_to_gloss
+    return video_paths, labels, idx_to_gloss, frame_info
 
 
 @torch.no_grad()
@@ -285,7 +301,7 @@ def main():
     # Load dataset
     print("Step 2: Loading dataset...")
     split = None if args.split == 'all' else args.split
-    video_paths, labels, dataset_idx_to_gloss = load_wlasl_dataset(
+    video_paths, labels, dataset_idx_to_gloss, frame_info = load_wlasl_dataset(
         args.data_dir, 
         subset_file=args.subset,
         split=split
@@ -330,7 +346,8 @@ def main():
         landmark_extractor=landmark_extractor,
         videomae_processor=videomae_processor,
         num_frames=args.num_frames,
-        landmarks_dir=args.landmarks_dir
+        landmarks_dir=args.landmarks_dir,
+        frame_info=frame_info  # Pass frame trimming info
     )
     
     dataloader = DataLoader(
