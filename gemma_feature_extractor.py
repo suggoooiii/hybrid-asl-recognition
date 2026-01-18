@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-GEMMA 3 VISUAL FEATURE EXTRACTOR
-Extracts visual features from video frames using frozen Gemma 3 vision encoder.
+PALIGEMMA VISUAL FEATURE EXTRACTOR
+Extracts visual features from video frames using frozen PaliGemma vision encoder.
 
 Key Design:
-    - All Gemma weights are FROZEN (no training required)
+    - All PaliGemma weights are FROZEN (no training required)
     - Only used for feature extraction during preprocessing
     - Returns feature vectors that can be saved and reused
     - SignGemma-ready: Easy to swap models when SignGemma is released
 
 Usage:
-    extractor = GemmaFeatureExtractor(model_name='google/gemma-3-4b-it')
+    extractor = GemmaFeatureExtractor(model_name='google/paligemma-3b-pt-224')
     features = extractor.extract_video_features(video_path, num_frames=16)
     # features: (num_frames, feature_dim) numpy array
 """
@@ -21,26 +21,27 @@ import numpy as np
 import cv2
 from pathlib import Path
 from typing import List, Optional, Tuple
-from transformers import AutoProcessor, AutoModel
+from transformers import AutoProcessor, AutoModel, PaliGemmaForConditionalGeneration
+from PIL import Image
 import warnings
 
 
 class GemmaFeatureExtractor:
     """
-    Extract visual features from video frames using frozen Gemma 3 vision encoder.
+    Extract visual features from video frames using frozen PaliGemma vision encoder.
 
     Architecture:
-        Video Frames → [Gemma 3 Vision Encoder (FROZEN)] → Feature Vectors
+        Video Frames → [PaliGemma Vision Encoder (FROZEN)] → Feature Vectors
 
     Args:
-        model_name: HuggingFace model ID (e.g., 'google/gemma-3-4b-it')
+        model_name: HuggingFace model ID (default: 'google/paligemma-3b-pt-224')
         device: 'cuda', 'cpu', or 'mps'
         cache_dir: Optional cache directory for model weights
         use_flash_attention: Enable flash attention for faster inference (requires GPU)
     """
 
     def __init__(self,
-                 model_name: str = 'google/gemma-3-4b-it',
+                 model_name: str = 'google/paligemma-3b-pt-224',
                  device: str = 'cuda',
                  cache_dir: Optional[str] = None,
                  use_flash_attention: bool = False):
@@ -48,7 +49,7 @@ class GemmaFeatureExtractor:
         self.device = device
         self.model_name = model_name
 
-        print(f"Loading Gemma model: {model_name}")
+        print(f"Loading PaliGemma model: {model_name}")
         print(f"Device: {device}")
 
         # Load processor (handles image preprocessing)
@@ -67,7 +68,8 @@ class GemmaFeatureExtractor:
             model_kwargs['attn_implementation'] = 'flash_attention_2'
             print("✓ Using Flash Attention 2 for faster inference")
 
-        self.model = AutoModel.from_pretrained(
+        # Load PaliGemma model
+        self.model = PaliGemmaForConditionalGeneration.from_pretrained(
             model_name,
             **model_kwargs
         ).to(device)
@@ -78,44 +80,27 @@ class GemmaFeatureExtractor:
 
         self.model.eval()
 
+        # Get the vision tower for direct feature extraction
+        self.vision_tower = self.model.vision_tower
+
         # Get feature dimension from vision encoder
         # For Gemma 3, this is typically from the vision tower
         self.feature_dim = self._get_feature_dim()
 
-        print(f"✓ Gemma model loaded (frozen)")
+        print(f"✓ PaliGemma model loaded (frozen)")
         print(f"✓ Feature dimension: {self.feature_dim}")
 
     def _get_feature_dim(self) -> int:
         """Infer feature dimension from the vision encoder."""
-        # Create dummy input to determine output dimension (as numpy array for processor)
-        dummy_image = np.zeros((224, 224, 3), dtype=np.uint8)
-
-        with torch.no_grad():
-            try:
-                # Process through full model using the processor
-                inputs = self.processor(
-                    images=dummy_image, return_tensors="pt")
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                outputs = self.model(**inputs, output_hidden_states=True)
-
-                # Try to get vision features
-                if hasattr(outputs, 'vision_hidden_states') and outputs.vision_hidden_states is not None:
-                    hidden = outputs.vision_hidden_states
-                    if len(hidden) > 0 and hidden[-1] is not None:
-                        return hidden[-1].shape[-1]
-
-                if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-                    hidden = outputs.hidden_states
-                    if len(hidden) > 0 and hidden[-1] is not None:
-                        return hidden[-1].shape[-1]
-
-                # Default dimension for Gemma models
-                return 2048
-
-            except Exception as e:
-                warnings.warn(
-                    f"Could not infer feature dimension: {e}. Using default 2048.")
-                return 2048
+        # PaliGemma's SigLIP vision tower has a known hidden size
+        try:
+            config = self.vision_tower.config
+            if hasattr(config, 'hidden_size'):
+                return config.hidden_size
+        except:
+            pass
+        # Default for PaliGemma SigLIP (224x224 model)
+        return 1152
 
     def extract_frame_features(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -130,46 +115,41 @@ class GemmaFeatureExtractor:
         if frame is None:
             raise ValueError("Frame is None")
 
+        # Convert numpy array to PIL Image for processor
+        pil_image = Image.fromarray(frame)
+
         with torch.no_grad():
-            # Preprocess frame
-            inputs = self.processor(images=frame, return_tensors="pt")
-            if inputs is None:
-                raise RuntimeError("Processor returned None")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            # Process image - PaliGemma processor needs text input
+            inputs = self.processor(
+                images=pil_image,
+                text="",  # Empty text for feature extraction only
+                return_tensors="pt"
+            )
 
-            # Extract features
-            outputs = self.model(**inputs, output_hidden_states=True)
+            # Get pixel values and move to device
+            pixel_values = inputs['pixel_values'].to(
+                self.device,
+                dtype=torch.float16 if self.device == 'cuda' else torch.float32
+            )
 
-            if outputs is None:
-                raise RuntimeError("Model returned None outputs")
+            # Extract features directly from vision tower (SigLIP)
+            vision_outputs = self.vision_tower(pixel_values)
 
-            # Get vision features (try multiple paths)
-            features = None
+            # Get features from vision tower output
+            if hasattr(vision_outputs, 'last_hidden_state') and vision_outputs.last_hidden_state is not None:
+                features = vision_outputs.last_hidden_state
+            elif hasattr(vision_outputs, 'pooler_output') and vision_outputs.pooler_output is not None:
+                return vision_outputs.pooler_output.squeeze(0).cpu().numpy().astype(np.float32)
+            elif isinstance(vision_outputs, tuple) and len(vision_outputs) > 0:
+                features = vision_outputs[0]
+            else:
+                features = vision_outputs
 
-            # Path 1: Direct vision hidden states
-            if hasattr(outputs, 'vision_hidden_states') and outputs.vision_hidden_states is not None:
-                hidden = outputs.vision_hidden_states
-                if len(hidden) > 0:
-                    features = hidden[-1]
+            # Mean pool over spatial/patch dimension
+            # Shape: (1, num_patches, hidden_size) -> (hidden_size,)
+            pooled = features.mean(dim=1).squeeze(0)
 
-            # Path 2: General hidden states
-            if features is None and hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-                hidden = outputs.hidden_states
-                if len(hidden) > 0:
-                    features = hidden[-1]
-
-            # Path 3: Last hidden state
-            if features is None and hasattr(outputs, 'last_hidden_state') and outputs.last_hidden_state is not None:
-                features = outputs.last_hidden_state
-
-            if features is None:
-                raise RuntimeError(
-                    "Could not extract features from model output - all feature paths returned None")
-
-            # Pool features (mean pooling over sequence dimension)
-            features = features.mean(dim=1).squeeze(0)
-
-            return features.cpu().numpy()
+            return pooled.cpu().numpy().astype(np.float32)
 
     def extract_video_features(self,
                                video_path: str,
@@ -269,29 +249,39 @@ class GemmaFeatureExtractor:
         Returns:
             Feature array of shape (len(frames), feature_dim)
         """
+        # Convert to PIL images
+        pil_images = [Image.fromarray(f) for f in frames]
+
         with torch.no_grad():
             # Process all frames at once
-            inputs = self.processor(images=frames, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            inputs = self.processor(
+                images=pil_images,
+                text=[""] * len(pil_images),
+                return_tensors="pt",
+                padding=True
+            )
 
-            # Extract features
-            outputs = self.model(**inputs, output_hidden_states=True)
+            pixel_values = inputs['pixel_values'].to(
+                self.device,
+                dtype=torch.float16 if self.device == 'cuda' else torch.float32
+            )
 
-            # Get vision features
-            if hasattr(outputs, 'vision_hidden_states') and outputs.vision_hidden_states is not None:
-                features = outputs.vision_hidden_states[-1]
-            elif hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-                features = outputs.hidden_states[-1]
-            elif hasattr(outputs, 'last_hidden_state'):
-                features = outputs.last_hidden_state
+            # Extract features from vision tower
+            vision_outputs = self.vision_tower(pixel_values)
+
+            if hasattr(vision_outputs, 'last_hidden_state') and vision_outputs.last_hidden_state is not None:
+                features = vision_outputs.last_hidden_state
+            elif hasattr(vision_outputs, 'pooler_output') and vision_outputs.pooler_output is not None:
+                return vision_outputs.pooler_output.cpu().numpy().astype(np.float32)
+            elif isinstance(vision_outputs, tuple) and len(vision_outputs) > 0:
+                features = vision_outputs[0]
             else:
-                raise RuntimeError(
-                    "Could not extract features from model output")
+                features = vision_outputs
 
             # Pool features (mean pooling over sequence dimension)
             features = features.mean(dim=1)  # (batch, feature_dim)
 
-            return features.cpu().numpy()
+            return features.cpu().numpy().astype(np.float32)
 
 
 if __name__ == '__main__':
@@ -302,8 +292,8 @@ if __name__ == '__main__':
         description='Test Gemma Feature Extractor')
     parser.add_argument('--video_path', type=str, required=True,
                         help='Path to test video')
-    parser.add_argument('--model_name', type=str, default='google/gemma-3-4b-it',
-                        help='Gemma model name')
+    parser.add_argument('--model_name', type=str, default='google/paligemma-3b-pt-224',
+                        help='PaliGemma model name')
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu', 'mps'])
     parser.add_argument('--num_frames', type=int, default=16)
@@ -311,7 +301,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print("="*70)
-    print("GEMMA FEATURE EXTRACTOR TEST")
+    print("PALIGEMMA FEATURE EXTRACTOR TEST")
     print("="*70)
 
     # Initialize extractor

@@ -110,8 +110,8 @@ def main():
                         help='Output directory for Gemma features (.npy files)')
     parser.add_argument('--subset', type=str, default='nslt_100.json',
                         help='Subset file (nslt_100.json, nslt_300.json, etc.)')
-    parser.add_argument('--model_name', type=str, default='google/gemma-3-4b-it',
-                        help='Gemma model name from HuggingFace')
+    parser.add_argument('--model_name', type=str, default='google/paligemma-3b-pt-224',
+                        help='PaliGemma model name from HuggingFace')
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu', 'mps'],
                         help='Device to run on')

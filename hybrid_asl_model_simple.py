@@ -32,7 +32,7 @@ from typing import Optional, Tuple
 from hybrid_asl_model import LandmarkEncoder
 
 # Default Gemma feature dimension (can be overridden)
-DEFAULT_GEMMA_FEATURE_DIM = 2048
+DEFAULT_GEMMA_FEATURE_DIM = 1152  # PaliGemma SigLIP vision tower output dimension
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -42,19 +42,19 @@ DEFAULT_GEMMA_FEATURE_DIM = 2048
 class VisualProjection(nn.Module):
     """
     Project pre-extracted Gemma visual features to hidden dimension.
-    
+
     Input: (batch, num_frames, gemma_feature_dim)
     Output: (batch, hidden_dim)
     """
-    
+
     def __init__(self,
                  gemma_feature_dim: int = DEFAULT_GEMMA_FEATURE_DIM,
                  hidden_dim: int = 256,
                  dropout: float = 0.3):
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
-        
+
         # Frame-level projection
         self.frame_projection = nn.Sequential(
             nn.Linear(gemma_feature_dim, hidden_dim),
@@ -62,12 +62,12 @@ class VisualProjection(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout)
         )
-        
+
         # Temporal encoding (positional encoding for frames)
         self.temporal_encoding = nn.Parameter(
             torch.randn(1, 64, hidden_dim) * 0.02
         )
-        
+
         # Temporal attention (lightweight)
         self.temporal_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -75,39 +75,39 @@ class VisualProjection(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        
+
         # Output projection
         self.output_projection = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU()
         )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (batch, num_frames, gemma_feature_dim) pre-extracted Gemma features
-        
+
         Returns:
             (batch, hidden_dim) projected visual features
         """
         batch_size, num_frames, _ = x.shape
-        
+
         # Project each frame
         x = self.frame_projection(x)  # (batch, num_frames, hidden_dim)
-        
+
         # Add temporal encoding
         x = x + self.temporal_encoding[:, :num_frames, :]
-        
+
         # Temporal attention (self-attention over frames)
         x, _ = self.temporal_attention(x, x, x)
-        
+
         # Global average pooling over time
         x = x.mean(dim=1)  # (batch, hidden_dim)
-        
+
         # Output projection
         x = self.output_projection(x)
-        
+
         return x
 
 
@@ -118,12 +118,12 @@ class VisualProjection(nn.Module):
 class HybridASLModelSimple(nn.Module):
     """
     Simplified hybrid model using pre-extracted Gemma features.
-    
+
     Architecture:
         Gemma Features → Visual Projection (256) ─┐
                                                    ├─→ Fusion (512) → Classifier
         Landmarks → Landmark Encoder (256) ────────┘
-    
+
     Args:
         num_classes: Number of sign classes
         gemma_feature_dim: Dimension of pre-extracted Gemma features
@@ -131,7 +131,7 @@ class HybridASLModelSimple(nn.Module):
         dropout: Dropout rate
         fusion_type: 'concat', 'attention', or 'gated'
     """
-    
+
     def __init__(self,
                  num_classes: int,
                  gemma_feature_dim: int = DEFAULT_GEMMA_FEATURE_DIM,
@@ -139,11 +139,11 @@ class HybridASLModelSimple(nn.Module):
                  dropout: float = 0.3,
                  fusion_type: str = 'concat'):
         super().__init__()
-        
+
         self.fusion_type = fusion_type
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
-        
+
         # ─────────────────────────────────────────────────────────────
         # Stream 1: Visual Projection (for Gemma features)
         # ─────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ class HybridASLModelSimple(nn.Module):
             hidden_dim=hidden_dim,
             dropout=dropout
         )
-        
+
         # ─────────────────────────────────────────────────────────────
         # Stream 2: Landmark Encoder (reused from hybrid_asl_model.py)
         # ─────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ class HybridASLModelSimple(nn.Module):
             num_layers=2,
             dropout=dropout
         )
-        
+
         # ─────────────────────────────────────────────────────────────
         # Fusion Layer
         # ─────────────────────────────────────────────────────────────
@@ -201,7 +201,7 @@ class HybridASLModelSimple(nn.Module):
             )
         else:
             raise ValueError(f"Unknown fusion_type: {fusion_type}")
-        
+
         # ─────────────────────────────────────────────────────────────
         # Classifier Head
         # ─────────────────────────────────────────────────────────────
@@ -211,47 +211,52 @@ class HybridASLModelSimple(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes)
         )
-    
+
     def forward(self, gemma_features: torch.Tensor, landmarks: torch.Tensor) -> torch.Tensor:
         """
         Args:
             gemma_features: (batch, num_frames, gemma_feature_dim) pre-extracted features
             landmarks: (batch, seq_len, 162) landmark features
-        
+
         Returns:
             logits: (batch, num_classes)
         """
         # Encode both streams
-        visual_features = self.visual_projection(gemma_features)      # (B, hidden)
-        landmark_features = self.landmark_encoder(landmarks)          # (B, hidden)
-        
+        visual_features = self.visual_projection(
+            gemma_features)      # (B, hidden)
+        landmark_features = self.landmark_encoder(
+            landmarks)          # (B, hidden)
+
         # Fusion
         if self.fusion_type == 'concat':
             fused = torch.cat([visual_features, landmark_features], dim=-1)
             fused = self.fusion(fused)
-        
+
         elif self.fusion_type == 'attention':
             # Cross-attention between streams
             v_expanded = visual_features.unsqueeze(1)      # (B, 1, hidden)
             l_expanded = landmark_features.unsqueeze(1)    # (B, 1, hidden)
-            
-            attended_v, _ = self.fusion_attention(v_expanded, l_expanded, l_expanded)
-            attended_l, _ = self.fusion_attention(l_expanded, v_expanded, v_expanded)
-            
-            fused = torch.cat([attended_v.squeeze(1), attended_l.squeeze(1)], dim=-1)
+
+            attended_v, _ = self.fusion_attention(
+                v_expanded, l_expanded, l_expanded)
+            attended_l, _ = self.fusion_attention(
+                l_expanded, v_expanded, v_expanded)
+
+            fused = torch.cat(
+                [attended_v.squeeze(1), attended_l.squeeze(1)], dim=-1)
             fused = self.fusion(fused)
-        
+
         elif self.fusion_type == 'gated':
             combined = torch.cat([visual_features, landmark_features], dim=-1)
             gate = self.gate(combined)
             fused = gate * visual_features + (1 - gate) * landmark_features
             fused = self.fusion(fused)
-        
+
         # Classification
         logits = self.classifier(fused)
-        
+
         return logits
-    
+
     def predict(self, gemma_features: torch.Tensor, landmarks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get predictions with confidence scores."""
         logits = self.forward(gemma_features, landmarks)
@@ -267,9 +272,9 @@ class HybridASLModelSimple(nn.Module):
 class PreextractedDataset(torch.utils.data.Dataset):
     """
     Dataset that loads pre-extracted Gemma features and landmarks.
-    
+
     This is much faster than extracting features on-the-fly.
-    
+
     Args:
         video_ids: List of video IDs
         labels: List of class labels
@@ -277,62 +282,65 @@ class PreextractedDataset(torch.utils.data.Dataset):
         landmarks_dir: Directory containing {video_id}_landmarks.npy files
         num_frames: Number of frames to use
     """
-    
+
     def __init__(self,
                  video_ids: list,
                  labels: list,
                  gemma_features_dir: str,
                  landmarks_dir: str,
                  num_frames: int = 16):
-        
+
         self.video_ids = video_ids
         self.labels = labels
         self.gemma_features_dir = Path(gemma_features_dir)
         self.landmarks_dir = Path(landmarks_dir)
         self.num_frames = num_frames
-        
+
         # Pre-check which features are available
         self.available_indices = []
         for idx, video_id in enumerate(video_ids):
             gemma_path = self.gemma_features_dir / f"{video_id}_gemma.npy"
             landmark_path = self.landmarks_dir / f"{video_id}_landmarks.npy"
-            
+
             if gemma_path.exists() and landmark_path.exists():
                 self.available_indices.append(idx)
-        
-        print(f"  Found {len(self.available_indices)}/{len(video_ids)} complete feature pairs")
-        
+
+        print(
+            f"  Found {len(self.available_indices)}/{len(video_ids)} complete feature pairs")
+
         if len(self.available_indices) == 0:
-            raise ValueError("No videos with both Gemma features and landmarks found!")
-    
+            raise ValueError(
+                "No videos with both Gemma features and landmarks found!")
+
     def __len__(self):
         return len(self.available_indices)
-    
+
     def _pad_or_truncate(self, features: np.ndarray) -> np.ndarray:
         """Helper function to pad or truncate features to num_frames."""
         if len(features) < self.num_frames:
-            padding = np.tile(features[-1:], (self.num_frames - len(features), 1))
+            padding = np.tile(
+                features[-1:], (self.num_frames - len(features), 1))
             features = np.vstack([features, padding])
         return features[:self.num_frames]
-    
+
     def __getitem__(self, idx):
         # Map to original index
         orig_idx = self.available_indices[idx]
         video_id = self.video_ids[orig_idx]
         label = self.labels[orig_idx]
-        
+
         # Load Gemma features
         gemma_path = self.gemma_features_dir / f"{video_id}_gemma.npy"
         gemma_features = np.load(gemma_path)
-        
+
         # Load landmarks
         landmark_path = self.landmarks_dir / f"{video_id}_landmarks.npy"
         landmarks = np.load(landmark_path)
-        
+
         # Pad or truncate to correct number of frames
         gemma_features = self._pad_or_truncate(gemma_features)
         landmarks = self._pad_or_truncate(landmarks)
-        
+
         return {
             'gemma_features': torch.tensor(gemma_features, dtype=torch.float32),
             'landmarks': torch.tensor(landmarks, dtype=torch.float32),
@@ -345,7 +353,7 @@ if __name__ == '__main__':
     print("="*70)
     print("SIMPLIFIED HYBRID MODEL TEST")
     print("="*70)
-    
+
     # Create dummy model
     model = HybridASLModelSimple(
         num_classes=100,
@@ -353,31 +361,32 @@ if __name__ == '__main__':
         hidden_dim=256,
         fusion_type='concat'
     )
-    
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+    trainable_params = sum(p.numel()
+                           for p in model.parameters() if p.requires_grad)
+
     print(f"✓ Model created")
     print(f"✓ Total parameters: {total_params:,}")
     print(f"✓ Trainable parameters: {trainable_params:,}")
-    
+
     # Test forward pass
     batch_size = 4
     num_frames = 16
     gemma_dim = DEFAULT_GEMMA_FEATURE_DIM
-    
+
     gemma_features = torch.randn(batch_size, num_frames, gemma_dim)
     landmarks = torch.randn(batch_size, num_frames, 162)
-    
+
     logits = model(gemma_features, landmarks)
-    
+
     print(f"\n✓ Forward pass successful")
     print(f"✓ Input shapes:")
     print(f"    Gemma features: {gemma_features.shape}")
     print(f"    Landmarks: {landmarks.shape}")
     print(f"✓ Output logits shape: {logits.shape}")
-    
+
     print("\n" + "="*70)
     print("TEST COMPLETE!")
     print("="*70)
