@@ -1,427 +1,767 @@
 #!/usr/bin/env python3
 """
-FAST TRAINING SCRIPT USING PRE-EXTRACTED GEMMA FEATURES
+Simple training script for Hybrid ASL Recognition using pre-extracted features.
+Loads pre-extracted Gemma and landmark features from .npy files for fast training.
 
-Train the simplified hybrid model using pre-extracted features.
-Much faster than training with VideoMAE since no large model forward pass.
-
-Usage:
-    python train_simple.py \
-        --data_dir data/wlasl \
-        --gemma_features_dir data/wlasl/gemma_features \
-        --landmarks_dir data/wlasl/landmarks \
-        --batch_size 32 \
-        --epochs 50
-
-Key Benefits:
-    - 10-50x faster training (no Gemma forward pass)
-    - Can use larger batch sizes (32-64+)
-    - Only ~2M trainable parameters
-    - Lower GPU memory requirements
+This is the PRIMARY training pipeline - optimized for fast iteration with:
+- Pre-extracted Gemma features (frozen visual encoder)
+- Pre-extracted MediaPipe landmarks
+- ~2.8M trainable parameters
+- 2-4 GB GPU memory requirement
 """
 
 import argparse
+import json
+import logging
+import os
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from pathlib import Path
-import json
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
-from hybrid_asl_model_simple import HybridASLModelSimple, PreextractedDataset, DEFAULT_GEMMA_FEATURE_DIM
+from hybrid_asl_model_simple import SimpleHybridASLModel
 
 
-def load_wlasl_metadata(data_dir, subset_file='nslt_100.json'):
-    """
-    Load WLASL metadata for training.
-    
-    Returns:
-        video_ids: List of video IDs
-        labels: List of class labels
-        idx_to_gloss: Dict mapping class index to gloss name
-    """
-    data_dir = Path(data_dir)
-    
-    # Load missing videos
-    missing_videos = set()
-    missing_path = data_dir / 'missing.txt'
-    if missing_path.exists():
-        with open(missing_path, 'r') as f:
-            missing_videos = {line.strip() for line in f if line.strip()}
-    
-    # Load subset config
-    subset_path = data_dir / subset_file
+def setup_logging(log_dir: str = "logs", verbose: bool = False) -> tuple:
+    """Setup logging to both file and console."""
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"training_{timestamp}.log")
+
+    # Create logger
+    logger = logging.getLogger("train_simple")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []  # Clear existing handlers
+
+    # File handler (DEBUG level - capture everything)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    # Console handler (INFO or DEBUG based on verbose)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console_formatter = logging.Formatter('%(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+
+    logger.info(f"Logging to: {log_file}")
+
+    return logger, log_file
+
+
+class FeatureAugmentation:
+    """Data augmentation for pre-extracted features."""
+
+    def __init__(
+        self,
+        temporal_jitter: bool = True,
+        feature_dropout: float = 0.1,
+        feature_noise: float = 0.05,
+        temporal_mask_prob: float = 0.1,
+        landmark_jitter: float = 0.02,
+        random_temporal_crop: bool = True,
+        mixup_alpha: float = 0.0,  # Set > 0 to enable mixup
+    ):
+        """
+        Initialize augmentation parameters.
+
+        Args:
+            temporal_jitter: Randomly shift/shuffle temporal order slightly
+            feature_dropout: Probability of dropping feature dimensions
+            feature_noise: Std of Gaussian noise to add to features
+            temporal_mask_prob: Probability of masking entire frames
+            landmark_jitter: Std of jitter to add to landmark coordinates
+            random_temporal_crop: Randomly crop temporal dimension
+            mixup_alpha: Alpha parameter for mixup (0 = disabled)
+        """
+        self.temporal_jitter = temporal_jitter
+        self.feature_dropout = feature_dropout
+        self.feature_noise = feature_noise
+        self.temporal_mask_prob = temporal_mask_prob
+        self.landmark_jitter = landmark_jitter
+        self.random_temporal_crop = random_temporal_crop
+        self.mixup_alpha = mixup_alpha
+
+    def __call__(
+        self,
+        gemma_features: np.ndarray,
+        landmark_features: np.ndarray,
+        training: bool = True
+    ) -> tuple:
+        """
+        Apply augmentations to features.
+
+        Args:
+            gemma_features: (num_frames, feature_dim) visual features
+            landmark_features: (num_frames, 162) landmark features
+            training: Whether in training mode (augmentations only applied if True)
+
+        Returns:
+            Augmented (gemma_features, landmark_features)
+        """
+        if not training:
+            return gemma_features, landmark_features
+
+        gemma_features = gemma_features.copy()
+        landmark_features = landmark_features.copy()
+
+        num_frames = gemma_features.shape[0]
+
+        # 1. Temporal jitter - small random shifts in frame order
+        if self.temporal_jitter and num_frames > 2 and random.random() < 0.5:
+            # Swap adjacent frames randomly
+            for i in range(num_frames - 1):
+                if random.random() < 0.2:
+                    gemma_features[[i, i+1]] = gemma_features[[i+1, i]]
+                    landmark_features[[i, i+1]] = landmark_features[[i+1, i]]
+
+        # 2. Random temporal crop and resize
+        if self.random_temporal_crop and num_frames > 4 and random.random() < 0.3:
+            crop_ratio = random.uniform(0.7, 1.0)
+            crop_frames = max(4, int(num_frames * crop_ratio))
+            start_idx = random.randint(0, num_frames - crop_frames)
+
+            gemma_cropped = gemma_features[start_idx:start_idx + crop_frames]
+            landmark_cropped = landmark_features[start_idx:start_idx + crop_frames]
+
+            # Resize back to original length using linear interpolation
+            indices = np.linspace(0, crop_frames - 1, num_frames)
+            gemma_features = np.array([
+                gemma_cropped[int(i)] * (1 - (i % 1)) +
+                gemma_cropped[min(int(i) + 1, crop_frames - 1)] * (i % 1)
+                for i in indices
+            ])
+            landmark_features = np.array([
+                landmark_cropped[int(i)] * (1 - (i % 1)) +
+                landmark_cropped[min(int(i) + 1, crop_frames - 1)] * (i % 1)
+                for i in indices
+            ])
+
+        # 3. Temporal masking - randomly mask entire frames
+        if self.temporal_mask_prob > 0:
+            mask = np.random.random(num_frames) > self.temporal_mask_prob
+            # Ensure at least half the frames are kept
+            if mask.sum() < num_frames // 2:
+                keep_indices = np.random.choice(
+                    num_frames, num_frames // 2, replace=False)
+                mask[keep_indices] = True
+
+            # Zero out masked frames
+            gemma_features[~mask] = 0
+            landmark_features[~mask] = 0
+
+        # 4. Feature dropout - randomly zero feature dimensions
+        if self.feature_dropout > 0:
+            gemma_mask = np.random.random(
+                gemma_features.shape[1]) > self.feature_dropout
+            gemma_features = gemma_features * gemma_mask
+
+            landmark_mask = np.random.random(
+                landmark_features.shape[1]) > self.feature_dropout
+            landmark_features = landmark_features * landmark_mask
+
+        # 5. Gaussian noise on Gemma features
+        if self.feature_noise > 0:
+            noise = np.random.normal(
+                0, self.feature_noise, gemma_features.shape)
+            gemma_features = gemma_features + noise
+
+        # 6. Landmark jitter - add small noise to coordinates
+        if self.landmark_jitter > 0:
+            jitter = np.random.normal(
+                0, self.landmark_jitter, landmark_features.shape)
+            landmark_features = landmark_features + jitter
+
+        return gemma_features.astype(np.float32), landmark_features.astype(np.float32)
+
+
+class PreExtractedFeaturesDataset(Dataset):
+    """Dataset that loads pre-extracted Gemma and landmark features."""
+
+    def __init__(
+        self,
+        video_ids: list,
+        labels: list,
+        gemma_features_dir: str,
+        landmarks_dir: str,
+        num_frames: int = 16,
+        augmentation: Optional[FeatureAugmentation] = None,
+        training: bool = True,
+    ):
+        """
+        Initialize the dataset.
+
+        Args:
+            video_ids: List of video IDs
+            labels: List of corresponding labels
+            gemma_features_dir: Directory containing Gemma feature .npy files
+            landmarks_dir: Directory containing landmark .npy files
+            num_frames: Number of frames to use (will pad/truncate)
+            augmentation: Optional augmentation to apply
+            training: Whether in training mode
+        """
+        self.video_ids = video_ids
+        self.labels = labels
+        self.gemma_features_dir = Path(gemma_features_dir)
+        self.landmarks_dir = Path(landmarks_dir)
+        self.num_frames = num_frames
+        self.augmentation = augmentation
+        self.training = training
+
+        # Verify files exist and filter out missing ones
+        self.valid_indices = []
+        for i, vid in enumerate(video_ids):
+            gemma_path = self.gemma_features_dir / f"{vid}_gemma.npy"
+            landmark_path = self.landmarks_dir / f"{vid}_landmarks.npy"
+            if gemma_path.exists() and landmark_path.exists():
+                self.valid_indices.append(i)
+
+        logging.getLogger("train_simple").info(
+            f"Dataset: {len(self.valid_indices)}/{len(video_ids)} videos have both features"
+        )
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        actual_idx = self.valid_indices[idx]
+        video_id = self.video_ids[actual_idx]
+        label = self.labels[actual_idx]
+
+        # Load pre-extracted features
+        gemma_path = self.gemma_features_dir / f"{video_id}_gemma.npy"
+        landmark_path = self.landmarks_dir / f"{video_id}_landmarks.npy"
+
+        gemma_features = np.load(gemma_path)  # (num_frames, feature_dim)
+        landmark_features = np.load(landmark_path)  # (num_frames, 162)
+
+        # Ensure consistent number of frames
+        gemma_features = self._adjust_frames(gemma_features, self.num_frames)
+        landmark_features = self._adjust_frames(
+            landmark_features, self.num_frames)
+
+        # Apply augmentation
+        if self.augmentation is not None:
+            gemma_features, landmark_features = self.augmentation(
+                gemma_features, landmark_features, training=self.training
+            )
+
+        return (
+            torch.FloatTensor(gemma_features),
+            torch.FloatTensor(landmark_features),
+            torch.LongTensor([label])[0]
+        )
+
+    def _adjust_frames(self, features: np.ndarray, target_frames: int) -> np.ndarray:
+        """Adjust feature array to have exactly target_frames frames."""
+        current_frames = features.shape[0]
+
+        if current_frames == target_frames:
+            return features
+        elif current_frames > target_frames:
+            # Uniformly sample frames
+            indices = np.linspace(0, current_frames - 1,
+                                  target_frames, dtype=int)
+            return features[indices]
+        else:
+            # Pad with zeros
+            padding = np.zeros(
+                (target_frames - current_frames, features.shape[1]))
+            return np.vstack([features, padding])
+
+    def get_class_weights(self) -> torch.Tensor:
+        """Calculate class weights for balanced sampling."""
+        valid_labels = [self.labels[i] for i in self.valid_indices]
+        class_counts = np.bincount(valid_labels)
+        # Avoid division by zero
+        class_counts = np.maximum(class_counts, 1)
+        weights = 1.0 / class_counts
+        sample_weights = weights[valid_labels]
+        return torch.FloatTensor(sample_weights)
+
+
+def load_wlasl_data(data_dir: str, subset: str = "nslt_100.json"):
+    """Load WLASL dataset annotations."""
+    logger = logging.getLogger("train_simple")
+
+    data_path = Path(data_dir)
+    subset_path = data_path / subset
+
     if not subset_path.exists():
         raise FileNotFoundError(f"Subset file not found: {subset_path}")
-    
-    with open(subset_path, 'r') as f:
-        subset_data = json.load(f)
-    
-    # Load main annotations for gloss names
-    wlasl_path = data_dir / 'WLASL_v0.3.json'
-    if not wlasl_path.exists():
-        raise FileNotFoundError(f"WLASL annotations not found: {wlasl_path}")
-    
-    with open(wlasl_path, 'r') as f:
-        wlasl_data = json.load(f)
-    
-    # Build video_id -> gloss mapping
-    video_id_to_gloss = {}
-    for entry in wlasl_data:
-        gloss = entry['gloss']
-        for instance in entry['instances']:
-            video_id_to_gloss[instance['video_id']] = gloss
-    
-    # Build class_idx -> gloss mapping
-    idx_to_gloss = {}
-    for video_id, info in subset_data.items():
-        class_idx = info['action'][0]
-        if video_id in video_id_to_gloss:
-            gloss = video_id_to_gloss[video_id]
-            if class_idx not in idx_to_gloss:
-                idx_to_gloss[class_idx] = gloss
-    
+
+    with open(subset_path) as f:
+        data = json.load(f)
+
     video_ids = []
     labels = []
-    skipped = 0
-    
-    for video_id, info in subset_data.items():
-        # Skip missing videos
-        if video_id in missing_videos:
-            skipped += 1
-            continue
-        
-        video_path = data_dir / 'videos' / f"{video_id}.mp4"
-        if not video_path.exists():
-            skipped += 1
-            continue
-        
-        class_idx = info['action'][0]
-        video_ids.append(video_id)
-        labels.append(class_idx)
-    
-    print(f"Found {len(video_ids)} videos")
-    print(f"Found {len(idx_to_gloss)} classes")
-    if skipped > 0:
-        print(f"Skipped {skipped} missing videos")
-    
-    return video_ids, labels, idx_to_gloss
+
+    # Get unique classes
+    classes = set()
+    for video_id, info in data.items():
+        if info and 'action' in info and len(info['action']) >= 1:
+            classes.add(info['action'][0])
+
+    num_classes = len(classes)
+    logger.info(f"Found {num_classes} classes in {subset}")
+
+    # Load video info
+    for video_id, info in data.items():
+        if info and 'action' in info and len(info['action']) >= 1:
+            video_ids.append(video_id)
+            labels.append(info['action'][0])
+
+    logger.info(f"Loaded {len(video_ids)} videos from {subset}")
+
+    return video_ids, labels, num_classes
 
 
-def train_epoch(model, train_loader, optimizer, criterion, device):
+def create_label_mapping(data_dir: str, subset: str = "nslt_100.json") -> dict:
+    """Create mapping from class index to gloss name."""
+    data_path = Path(data_dir)
+
+    # Try to load main WLASL annotations for gloss names
+    main_json = data_path / "WLASL_v0.3.json"
+    if main_json.exists():
+        with open(main_json) as f:
+            wlasl_data = json.load(f)
+
+        # Build gloss mapping
+        gloss_map = {}
+        for entry in wlasl_data:
+            gloss = entry.get('gloss', '')
+            for instance in entry.get('instances', []):
+                video_id = instance.get('video_id', '')
+                gloss_map[video_id] = gloss
+
+        # Load subset to get class indices
+        subset_path = data_path / subset
+        with open(subset_path) as f:
+            subset_data = json.load(f)
+
+        # Map class index to gloss
+        class_to_gloss = {}
+        for video_id, info in subset_data.items():
+            if info and 'action' in info and len(info['action']) >= 1:
+                class_idx = info['action'][0]
+                if video_id in gloss_map and class_idx not in class_to_gloss:
+                    class_to_gloss[class_idx] = gloss_map[video_id]
+
+        return class_to_gloss
+
+    return {}
+
+
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    logger: logging.Logger,
+) -> tuple:
     """Train for one epoch."""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
-    
-    pbar = tqdm(train_loader, desc="Training", leave=False)
-    for batch in pbar:
-        gemma_features = batch['gemma_features'].to(device)
-        landmarks = batch['landmarks'].to(device)
-        labels = batch['label'].to(device)
-        
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False)
+
+    for batch_idx, (gemma_feat, landmark_feat, labels) in enumerate(pbar):
+        gemma_feat = gemma_feat.to(device)
+        landmark_feat = landmark_feat.to(device)
+        labels = labels.to(device)
+
         optimizer.zero_grad()
-        
-        logits = model(gemma_features, landmarks)
-        loss = criterion(logits, labels)
-        
+
+        outputs = model(gemma_feat, landmark_feat)
+        loss = criterion(outputs, labels)
+
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        
+
         total_loss += loss.item()
-        _, predicted = logits.max(1)
+        _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-        
+
         # Update progress bar
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
             'acc': f'{100.*correct/total:.2f}%'
         })
-    
-    return total_loss / len(train_loader), 100. * correct / total
+
+    avg_loss = total_loss / len(dataloader)
+    accuracy = 100. * correct / total
+
+    return avg_loss, accuracy
 
 
-@torch.no_grad()
-def evaluate(model, val_loader, criterion, device):
-    """Evaluate the model."""
+def validate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    logger: logging.Logger,
+) -> tuple:
+    """Validate the model."""
     model.eval()
     total_loss = 0
-    correct = 0
+    correct_top1 = 0
     correct_top5 = 0
     total = 0
-    
-    pbar = tqdm(val_loader, desc="Validating", leave=False)
-    for batch in pbar:
-        gemma_features = batch['gemma_features'].to(device)
-        landmarks = batch['landmarks'].to(device)
-        labels = batch['label'].to(device)
-        
-        logits = model(gemma_features, landmarks)
-        loss = criterion(logits, labels)
-        
-        total_loss += loss.item()
-        
-        # Top-1 accuracy
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        
-        # Top-5 accuracy
-        _, top5_pred = logits.topk(5, dim=1)
-        correct_top5 += sum(labels[i] in top5_pred[i] for i in range(labels.size(0)))
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
-    
-    top1_acc = 100. * correct / total
+
+    with torch.no_grad():
+        for gemma_feat, landmark_feat, labels in tqdm(dataloader, desc="Validating", leave=False):
+            gemma_feat = gemma_feat.to(device)
+            landmark_feat = landmark_feat.to(device)
+            labels = labels.to(device)
+
+            outputs = model(gemma_feat, landmark_feat)
+            loss = criterion(outputs, labels)
+
+            total_loss += loss.item()
+
+            # Top-1 accuracy
+            _, predicted = outputs.max(1)
+            correct_top1 += predicted.eq(labels).sum().item()
+
+            # Top-5 accuracy
+            _, top5_pred = outputs.topk(5, dim=1)
+            correct_top5 += sum(labels[i] in top5_pred[i]
+                                for i in range(labels.size(0)))
+
+            total += labels.size(0)
+
+    avg_loss = total_loss / len(dataloader)
+    top1_acc = 100. * correct_top1 / total
     top5_acc = 100. * correct_top5 / total
-    return total_loss / len(val_loader), top1_acc, top5_acc
+
+    return avg_loss, top1_acc, top5_acc
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Train simplified hybrid model with pre-extracted features')
-    
-    # Data paths
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Path to WLASL dataset')
-    parser.add_argument('--gemma_features_dir', type=str, required=True,
-                        help='Directory with pre-extracted Gemma features')
-    parser.add_argument('--landmarks_dir', type=str, default=None,
-                        help='Directory with pre-extracted landmarks (optional)')
-    parser.add_argument('--subset', type=str, default='nslt_100.json',
-                        help='Subset file (nslt_100.json, nslt_300.json, etc.)')
-    
-    # Model config
-    parser.add_argument('--gemma_feature_dim', type=int, default=None,
-                        help='Gemma feature dimension (auto-detected from metadata)')
-    parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--fusion_type', type=str, default='concat',
-                        choices=['concat', 'attention', 'gated'])
-    
-    # Training config
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--num_frames', type=int, default=16)
-    parser.add_argument('--device', type=str, default='cuda')
-    
-    # Output paths
-    parser.add_argument('--best_model_path', type=str, default='best_simple_model.pth',
-                        help='Path to save best model')
-    parser.add_argument('--final_model_path', type=str, default='final_simple_model.pth',
-                        help='Path to save final model')
-    parser.add_argument('--label_mapping_path', type=str, default='label_mapping.json',
-                        help='Path to save label mapping')
-    
-    # Checkpoint
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_simple',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--save_every', type=int, default=5,
-                        help='Save checkpoint every N epochs')
-    
+        description="Train Hybrid ASL Model with pre-extracted features")
+
+    # Data arguments
+    parser.add_argument("--data_dir", type=str,
+                        default="data/wlasl", help="Data directory")
+    parser.add_argument("--gemma_features_dir", type=str, default="data/wlasl/gemma_features",
+                        help="Directory with pre-extracted Gemma features")
+    parser.add_argument("--landmarks_dir", type=str, default="data/wlasl/landmarks",
+                        help="Directory with pre-extracted landmarks")
+    parser.add_argument("--subset", type=str,
+                        default="nslt_100.json", help="Subset to use")
+
+    # Model arguments
+    parser.add_argument("--gemma_feature_dim", type=int, default=1152,
+                        help="Dimension of Gemma features (1152 for PaliGemma)")
+    parser.add_argument("--hidden_dim", type=int,
+                        default=256, help="Hidden dimension")
+    parser.add_argument("--num_frames", type=int,
+                        default=16, help="Number of frames")
+    parser.add_argument("--fusion_type", type=str, default="concat",
+                        choices=["concat", "attention", "gated"], help="Fusion type")
+    parser.add_argument("--dropout", type=float,
+                        default=0.3, help="Dropout rate")
+
+    # Training arguments
+    parser.add_argument("--batch_size", type=int,
+                        default=32, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=100,
+                        help="Number of epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float,
+                        default=1e-4, help="Weight decay")
+    parser.add_argument("--device", type=str,
+                        default="cuda", help="Device to use")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--val_split", type=float,
+                        default=0.2, help="Validation split ratio")
+
+    # Augmentation arguments
+    parser.add_argument("--no_augmentation", action="store_true",
+                        help="Disable data augmentation")
+    parser.add_argument("--temporal_jitter", type=bool,
+                        default=True, help="Enable temporal jitter")
+    parser.add_argument("--feature_dropout", type=float,
+                        default=0.1, help="Feature dropout rate")
+    parser.add_argument("--feature_noise", type=float,
+                        default=0.05, help="Feature noise std")
+    parser.add_argument("--temporal_mask_prob", type=float,
+                        default=0.1, help="Temporal mask probability")
+    parser.add_argument("--landmark_jitter", type=float,
+                        default=0.02, help="Landmark jitter std")
+
+    # Sampling arguments
+    parser.add_argument("--balanced_sampling",
+                        action="store_true", help="Use class-balanced sampling")
+
+    # Output arguments
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints_simple",
+                        help="Checkpoint directory")
+    parser.add_argument("--log_dir", type=str,
+                        default="logs", help="Log directory")
+    parser.add_argument("--verbose", "-v",
+                        action="store_true", help="Verbose logging")
+
     args = parser.parse_args()
-    
-    print("="*70)
-    print("SIMPLIFIED HYBRID MODEL TRAINING")
-    print("="*70)
-    print()
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 1. Load metadata and detect feature dimension
-    # ─────────────────────────────────────────────────────────────────
-    print("Step 1: Loading dataset metadata...")
-    
-    video_ids, labels, idx_to_gloss = load_wlasl_metadata(
-        args.data_dir,
-        subset_file=args.subset
-    )
-    num_classes = len(idx_to_gloss)
-    
-    # Detect Gemma feature dimension from metadata
-    gemma_metadata_path = Path(args.gemma_features_dir) / 'extraction_metadata.json'
-    if gemma_metadata_path.exists():
-        with open(gemma_metadata_path, 'r') as f:
-            metadata = json.load(f)
-            gemma_feature_dim = metadata.get('feature_dim', DEFAULT_GEMMA_FEATURE_DIM)
-            print(f"✓ Detected Gemma feature dimension: {gemma_feature_dim}")
-    else:
-        gemma_feature_dim = args.gemma_feature_dim or DEFAULT_GEMMA_FEATURE_DIM
-        print(f"⚠ Using default Gemma feature dimension: {gemma_feature_dim}")
-    
-    print()
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 2. Create datasets
-    # ─────────────────────────────────────────────────────────────────
-    print("Step 2: Creating datasets...")
-    
-    # If landmarks_dir not specified, use default from data_dir
-    landmarks_dir = args.landmarks_dir
-    if landmarks_dir is None:
-        landmarks_dir = Path(args.data_dir) / 'landmarks'
-        if not landmarks_dir.exists():
-            raise ValueError(
-                f"Landmarks directory not found: {landmarks_dir}\n"
-                "Please run preprocess_landmarks.py first or specify --landmarks_dir"
-            )
-    
-    full_dataset = PreextractedDataset(
-        video_ids=video_ids,
-        labels=labels,
-        gemma_features_dir=args.gemma_features_dir,
-        landmarks_dir=landmarks_dir,
-        num_frames=args.num_frames
-    )
-    
+
+    # Setup logging
+    logger, log_file = setup_logging(args.log_dir, args.verbose)
+
+    logger.info("=" * 70)
+    logger.info("HYBRID ASL TRAINING (Pre-extracted Features)")
+    logger.info("=" * 70)
+
+    # Log all arguments
+    logger.info("\nConfiguration:")
+    for key, value in vars(args).items():
+        logger.info(f"  {key}: {value}")
+
+    # Set random seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Setup device
+    if args.device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA not available, using CPU")
+        args.device = "cpu"
+    device = torch.device(args.device)
+    logger.info(f"\nUsing device: {device}")
+
+    if device.type == "cuda":
+        logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(
+            f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Load data
+    logger.info(f"\nLoading data from {args.data_dir}")
+    logger.info(f"  Subset: {args.subset}")
+    video_ids, labels, num_classes = load_wlasl_data(
+        args.data_dir, args.subset)
+
+    # Create label mapping
+    label_mapping = create_label_mapping(args.data_dir, args.subset)
+    if label_mapping:
+        mapping_path = "label_mapping.json"
+        with open(mapping_path, "w") as f:
+            json.dump({str(k): v for k, v in label_mapping.items()}, f, indent=2)
+        logger.info(f"  Saved label mapping to {mapping_path}")
+
     # Split into train/val
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+    indices = list(range(len(video_ids)))
+    random.shuffle(indices)
+    split_idx = int(len(indices) * (1 - args.val_split))
+
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+
+    train_video_ids = [video_ids[i] for i in train_indices]
+    train_labels = [labels[i] for i in train_indices]
+    val_video_ids = [video_ids[i] for i in val_indices]
+    val_labels = [labels[i] for i in val_indices]
+
+    logger.info(f"\nData split:")
+    logger.info(f"  Train: {len(train_video_ids)} videos")
+    logger.info(f"  Val: {len(val_video_ids)} videos")
+
+    # Create augmentation
+    augmentation = None
+    if not args.no_augmentation:
+        augmentation = FeatureAugmentation(
+            temporal_jitter=args.temporal_jitter,
+            feature_dropout=args.feature_dropout,
+            feature_noise=args.feature_noise,
+            temporal_mask_prob=args.temporal_mask_prob,
+            landmark_jitter=args.landmark_jitter,
+            random_temporal_crop=True,
+        )
+        logger.info("\nData augmentation ENABLED:")
+        logger.info(f"  Temporal jitter: {args.temporal_jitter}")
+        logger.info(f"  Feature dropout: {args.feature_dropout}")
+        logger.info(f"  Feature noise: {args.feature_noise}")
+        logger.info(f"  Temporal mask prob: {args.temporal_mask_prob}")
+        logger.info(f"  Landmark jitter: {args.landmark_jitter}")
+        logger.info(f"  Random temporal crop: True")
+    else:
+        logger.info("\nData augmentation DISABLED")
+
+    # Create datasets
+    train_dataset = PreExtractedFeaturesDataset(
+        train_video_ids, train_labels,
+        args.gemma_features_dir, args.landmarks_dir,
+        num_frames=args.num_frames,
+        augmentation=augmentation,
+        training=True,
     )
-    
+
+    val_dataset = PreExtractedFeaturesDataset(
+        val_video_ids, val_labels,
+        args.gemma_features_dir, args.landmarks_dir,
+        num_frames=args.num_frames,
+        augmentation=None,  # No augmentation for validation
+        training=False,
+    )
+
+    # Create sampler for balanced training (optional)
+    train_sampler = None
+    shuffle_train = True
+    if args.balanced_sampling:
+        sample_weights = train_dataset.get_class_weights()
+        train_sampler = WeightedRandomSampler(
+            sample_weights, len(sample_weights), replacement=True
+        )
+        shuffle_train = False
+        logger.info("\nUsing balanced sampling (WeightedRandomSampler)")
+
+    # Create dataloaders
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        train_dataset, batch_size=args.batch_size,
+        shuffle=shuffle_train, sampler=train_sampler,
+        num_workers=4, pin_memory=True
     )
-    
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        val_dataset, batch_size=args.batch_size,
+        shuffle=False, num_workers=4, pin_memory=True
     )
-    
-    print(f"✓ Train samples: {len(train_dataset)}")
-    print(f"✓ Val samples: {len(val_dataset)}")
-    print()
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 3. Create model
-    # ─────────────────────────────────────────────────────────────────
-    print("Step 3: Creating model...")
-    
-    model = HybridASLModelSimple(
+
+    logger.info(f"\nDataloaders created:")
+    logger.info(f"  Train batches: {len(train_loader)}")
+    logger.info(f"  Val batches: {len(val_loader)}")
+
+    # Create model
+    model = SimpleHybridASLModel(
         num_classes=num_classes,
-        gemma_feature_dim=gemma_feature_dim,
+        gemma_feature_dim=args.gemma_feature_dim,
         hidden_dim=args.hidden_dim,
+        num_frames=args.num_frames,
         fusion_type=args.fusion_type,
-        dropout=0.3
-    ).to(args.device)
-    
+        dropout=args.dropout,
+    ).to(device)
+
+    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    print(f"✓ Total parameters: {total_params:,}")
-    print(f"✓ Trainable parameters: {trainable_params:,}")
-    print(f"✓ Fusion type: {args.fusion_type}")
-    print()
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 4. Setup training
-    # ─────────────────────────────────────────────────────────────────
-    print("Step 4: Setup training...")
-    
+    trainable_params = sum(p.numel()
+                           for p in model.parameters() if p.requires_grad)
+    logger.info(f"\nModel created:")
+    logger.info(f"  Total parameters: {total_params:,}")
+    logger.info(f"  Trainable parameters: {trainable_params:,}")
+    logger.info(f"  Fusion type: {args.fusion_type}")
+
+    # Setup training
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.learning_rate,
+        lr=args.lr,
         weight_decay=args.weight_decay
     )
-    
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=1e-6
+        optimizer, T_max=args.epochs, eta_min=1e-6
     )
-    
-    criterion = nn.CrossEntropyLoss()
-    
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"✓ Optimizer: AdamW (lr={args.learning_rate})")
-    print(f"✓ Scheduler: CosineAnnealingLR")
-    print(f"✓ Checkpoint dir: {checkpoint_dir}")
-    print()
-    
-    # ─────────────────────────────────────────────────────────────────
-    # 5. Train
-    # ─────────────────────────────────────────────────────────────────
-    print("Step 5: Starting training...")
-    print("="*70)
-    print()
-    
+
+    logger.info(f"\nTraining setup:")
+    logger.info(
+        f"  Optimizer: AdamW (lr={args.lr}, weight_decay={args.weight_decay})")
+    logger.info(f"  Scheduler: CosineAnnealingLR (T_max={args.epochs})")
+    logger.info(f"  Loss: CrossEntropyLoss (label_smoothing=0.1)")
+
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # Training loop
     best_val_acc = 0
-    
-    for epoch in range(args.epochs):
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        
+    logger.info("\n" + "=" * 70)
+    logger.info("TRAINING START")
+    logger.info("=" * 70)
+
+    for epoch in range(1, args.epochs + 1):
+        logger.info(f"\nEpoch {epoch}/{args.epochs}")
+
+        # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, args.device
+            model, train_loader, criterion, optimizer, device, epoch, logger
         )
-        
-        val_loss, val_acc, val_top5 = evaluate(
-            model, val_loader, criterion, args.device
+
+        # Validate
+        val_loss, val_top1, val_top5 = validate(
+            model, val_loader, criterion, device, logger
         )
-        
+
+        # Update scheduler
         scheduler.step()
-        
-        print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        print(f"  Val Loss: {val_loss:.4f}, Val Top-1: {val_acc:.2f}%, Val Top-5: {val_top5:.2f}%")
-        
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Log results
+        logger.info(
+            f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        logger.info(
+            f"  Val Loss: {val_loss:.4f}, Val Top-1: {val_top1:.2f}%, Val Top-5: {val_top5:.2f}%")
+        logger.info(f"  Learning Rate: {current_lr:.2e}")
+
         # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), args.best_model_path)
-            print(f"  ✓ New best model saved! ({val_acc:.2f}%)")
-        
-        # Save periodic checkpoint
-        if (epoch + 1) % args.save_every == 0:
-            checkpoint = {
+        if val_top1 > best_val_acc:
+            best_val_acc = val_top1
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_top1,
+                'val_top5': val_top5,
+                'args': vars(args),
+            }, "best_simple_model.pth")
+            logger.info(f"  ✓ New best model saved! (Top-1: {val_top1:.2f}%)")
+
+        # Save checkpoint every 5 epochs
+        if epoch % 5 == 0:
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir, f"checkpoint_epoch_{epoch}.pth")
+            torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_acc': best_val_acc,
-                'val_acc': val_acc,
-            }
-            checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pth'
-            torch.save(checkpoint, checkpoint_path)
-            print(f"  ✓ Checkpoint saved: {checkpoint_path}")
-        
-        print()
-    
+                'val_acc': val_top1,
+                'val_top5': val_top5,
+                'args': vars(args),
+            }, checkpoint_path)
+            logger.info(f"  ✓ Checkpoint saved: {checkpoint_path}")
+
     # Save final model
-    torch.save(model.state_dict(), args.final_model_path)
-    
-    print("="*70)
-    print("TRAINING COMPLETE!")
-    print("="*70)
-    print(f"✓ Best validation accuracy: {best_val_acc:.2f}%")
-    print(f"✓ Best model saved to: {args.best_model_path}")
-    print(f"✓ Final model saved to: {args.final_model_path}")
-    print(f"✓ Checkpoints saved to: {checkpoint_dir}/")
-    
-    # Save label mapping
-    with open(args.label_mapping_path, 'w') as f:
-        json.dump({str(k): v for k, v in idx_to_gloss.items()}, f, indent=2)
-    print(f"✓ Label mapping saved to: {args.label_mapping_path}")
-    print()
+    torch.save({
+        'epoch': args.epochs,
+        'model_state_dict': model.state_dict(),
+        'args': vars(args),
+    }, "final_simple_model.pth")
+
+    logger.info("\n" + "=" * 70)
+    logger.info("TRAINING COMPLETE!")
+    logger.info("=" * 70)
+    logger.info(f"✓ Best validation Top-1 accuracy: {best_val_acc:.2f}%")
+    logger.info(f"✓ Best model saved to: best_simple_model.pth")
+    logger.info(f"✓ Final model saved to: final_simple_model.pth")
+    logger.info(f"✓ Checkpoints saved to: {args.checkpoint_dir}/")
+    logger.info(f"✓ Training log saved to: {log_file}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
