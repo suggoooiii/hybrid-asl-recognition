@@ -8,6 +8,8 @@ Architecture:
     Video → [VideoMAE Branch] → Visual Features ─┐
                                                  ├─→ Fusion → Classifier → Text
     Video → [MediaPipe Branch] → Landmark Features┘
+
+Supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 """
 
 import torch
@@ -18,6 +20,79 @@ import mediapipe as mp
 import numpy as np
 import cv2
 from pathlib import Path
+
+# Optional: LoRA support
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LORA CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_lora_config(rank=8, alpha=16, dropout=0.1, target_modules=None):
+    """
+    Create LoRA configuration for VideoMAE.
+
+    Args:
+        rank: LoRA rank (lower = fewer params, higher = more capacity)
+        alpha: LoRA alpha scaling factor (typically 2x rank)
+        dropout: LoRA dropout for regularization
+        target_modules: Which modules to apply LoRA to (None = auto-detect)
+
+    Returns:
+        LoraConfig object
+    """
+    if not PEFT_AVAILABLE:
+        raise ImportError("peft library not installed. Run: pip install peft")
+
+    # Target the attention layers in VideoMAE's ViT encoder
+    if target_modules is None:
+        target_modules = [
+            "attention.attention.query",
+            "attention.attention.key",
+            "attention.attention.value",
+            "attention.output.dense",
+        ]
+
+    return LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        target_modules=target_modules,
+        bias="none",
+        modules_to_save=None,  # Don't save any modules outside LoRA
+    )
+
+
+def apply_lora_to_videomae(videomae_model, lora_config):
+    """
+    Apply LoRA adapters to a VideoMAE model.
+
+    Args:
+        videomae_model: Pre-trained VideoMAEModel
+        lora_config: LoraConfig object
+
+    Returns:
+        VideoMAE model with LoRA adapters
+    """
+    if not PEFT_AVAILABLE:
+        raise ImportError("peft library not installed. Run: pip install peft")
+
+    # Apply PEFT/LoRA to the model
+    lora_model = get_peft_model(videomae_model, lora_config)
+
+    # Print trainable parameters
+    trainable_params = sum(p.numel()
+                           for p in lora_model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in lora_model.parameters())
+    print(
+        f"  LoRA trainable params: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
+    return lora_model
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -295,7 +370,7 @@ class LandmarkEncoder(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# VIDEOMAE ENCODER (Visual features)
+# VIDEOMAE ENCODER (Visual features) - With LoRA support
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class VideoMAEEncoder(nn.Module):
@@ -304,20 +379,42 @@ class VideoMAEEncoder(nn.Module):
 
     Input: (batch, num_frames, channels, height, width)
     Output: (batch, hidden_dim)
+
+    Supports LoRA for parameter-efficient fine-tuning.
     """
 
     def __init__(self,
                  model_name='MCG-NJU/videomae-base',
                  hidden_dim=256,
                  freeze_backbone=False,
-                 dropout=0.3):
+                 dropout=0.3,
+                 use_lora=False,
+                 lora_rank=8,
+                 lora_alpha=16,
+                 lora_dropout=0.1):
         super().__init__()
+
+        self.use_lora = use_lora
 
         # Load pretrained VideoMAE
         self.videomae = VideoMAEModel.from_pretrained(model_name)
 
-        # Optionally freeze backbone
-        if freeze_backbone:
+        # Apply LoRA if requested (mutually exclusive with freeze)
+        if use_lora:
+            if not PEFT_AVAILABLE:
+                raise ImportError(
+                    "peft library required for LoRA. Run: pip install peft")
+
+            print(f"  Applying LoRA (rank={lora_rank}, alpha={lora_alpha})")
+            lora_config = get_lora_config(
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout
+            )
+            self.videomae = apply_lora_to_videomae(self.videomae, lora_config)
+
+        elif freeze_backbone:
+            # Only freeze if not using LoRA
             for param in self.videomae.parameters():
                 param.requires_grad = False
 
@@ -367,6 +464,8 @@ class HybridASLModel(nn.Module):
         VideoMAE → Visual Features (256) ─┐
                                           ├─→ Fusion (512) → Classifier → Logits
         Landmarks → Landmark Features (256)┘
+
+    Supports LoRA for parameter-efficient fine-tuning of VideoMAE.
     """
 
     def __init__(self,
@@ -375,20 +474,29 @@ class HybridASLModel(nn.Module):
                  hidden_dim=256,
                  freeze_videomae=False,
                  dropout=0.3,
-                 fusion_type='concat'):  # 'concat', 'attention', 'gated'
+                 fusion_type='concat',  # 'concat', 'attention', 'gated'
+                 use_lora=False,
+                 lora_rank=8,
+                 lora_alpha=16,
+                 lora_dropout=0.1):
         super().__init__()
 
         self.fusion_type = fusion_type
         self.hidden_dim = hidden_dim
+        self.use_lora = use_lora
 
         # ─────────────────────────────────────────────────────────────
-        # Stream 1: VideoMAE (Visual)
+        # Stream 1: VideoMAE (Visual) - with optional LoRA
         # ─────────────────────────────────────────────────────────────
         self.visual_encoder = VideoMAEEncoder(
             model_name=videomae_model,
             hidden_dim=hidden_dim,
             freeze_backbone=freeze_videomae,
-            dropout=dropout
+            dropout=dropout,
+            use_lora=use_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout
         )
 
         # ─────────────────────────────────────────────────────────────

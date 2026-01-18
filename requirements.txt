@@ -1,6 +1,7 @@
 # Core ML/DL
 torch>=2.0.0
 transformers>=4.30.0
+peft>=0.6.0  # Parameter-Efficient Fine-Tuning (LoRA)
 numpy
 scipy
 scikit-learn

@@ -185,6 +185,16 @@ def main():
                         choices=['light', 'medium', 'strong'],
                         help='Augmentation strength level')
 
+    # New: LoRA (Parameter-Efficient Fine-Tuning)
+    parser.add_argument('--use_lora', action='store_true',
+                        help='Use LoRA for parameter-efficient fine-tuning of VideoMAE')
+    parser.add_argument('--lora_rank', type=int, default=8,
+                        help='LoRA rank (lower = fewer params, default: 8)')
+    parser.add_argument('--lora_alpha', type=int, default=16,
+                        help='LoRA alpha scaling factor (default: 16)')
+    parser.add_argument('--lora_dropout', type=float, default=0.1,
+                        help='LoRA dropout rate (default: 0.1)')
+
     args = parser.parse_args()
 
     print("="*70)
@@ -311,13 +321,23 @@ def main():
     # ─────────────────────────────────────────────────────────────────
     print("Step 5: Creating hybrid model...")
 
+    # LoRA and freeze_videomae are mutually exclusive
+    if args.use_lora and args.freeze_videomae:
+        print("  Warning: --use_lora and --freeze_videomae are mutually exclusive.")
+        print("  Using LoRA (ignoring --freeze_videomae).")
+        args.freeze_videomae = False
+
     model = HybridASLModel(
         num_classes=num_classes,
         videomae_model='MCG-NJU/videomae-base',
         hidden_dim=args.hidden_dim,
         freeze_videomae=args.freeze_videomae,
         fusion_type=args.fusion_type,
-        dropout=0.3
+        dropout=0.3,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout
     )
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -327,6 +347,9 @@ def main():
     print(f"✓ Total parameters: {total_params:,}")
     print(f"✓ Trainable parameters: {trainable_params:,}")
     print(f"✓ Fusion type: {args.fusion_type}")
+    if args.use_lora:
+        print(
+            f"✓ LoRA: ENABLED (rank={args.lora_rank}, alpha={args.lora_alpha})")
     print()
 
     # ─────────────────────────────────────────────────────────────────
