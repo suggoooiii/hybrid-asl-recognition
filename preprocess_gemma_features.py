@@ -23,6 +23,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import json
+import traceback
 
 from gemma_feature_extractor import GemmaFeatureExtractor
 
@@ -201,7 +202,15 @@ def main():
             success_count += 1
 
         except Exception as e:
-            print(f"\n  Error processing {video_id} ({type(e).__name__}): {e}")
+            # Print full traceback for first few errors to help debug
+            if error_count < 3:
+                print(
+                    f"\n  Error processing {video_id} ({type(e).__name__}): {e}")
+                print("  Full traceback:")
+                traceback.print_exc()
+            else:
+                print(
+                    f"\n  Error processing {video_id} ({type(e).__name__}): {e}")
             error_count += 1
             continue
 
