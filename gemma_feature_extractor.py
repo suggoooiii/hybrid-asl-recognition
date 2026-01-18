@@ -31,14 +31,66 @@ import warnings
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(level=logging.INFO):
-    """Setup logging configuration for feature extraction."""
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s | %(levelname)-8s | %(message)s',
+def setup_logging(level=logging.INFO, log_file: Optional[str] = None, log_dir: str = "logs"):
+    """
+    Setup logging configuration for feature extraction.
+
+    Args:
+        level: Logging level (e.g., logging.INFO, logging.DEBUG)
+        log_file: Optional log filename. If None, auto-generates timestamped filename.
+        log_dir: Directory for log files (default: 'logs')
+
+    Returns:
+        Logger instance and path to log file
+    """
+    # Create log directory if it doesn't exist
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+
+    # Generate log filename with timestamp if not provided
+    if log_file is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"gemma_extraction_{timestamp}.log"
+
+    log_file_path = log_path / log_file
+
+    # Create formatters
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
         datefmt='%H:%M:%S'
     )
-    return logging.getLogger(__name__)
+
+    # Get root logger and clear existing handlers
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    # Remove existing handlers to avoid duplicates
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Console handler (INFO and above)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+
+    # File handler (DEBUG and above - captures everything)
+    file_handler = logging.FileHandler(
+        log_file_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)  # Always capture debug in file
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+
+    # Log the setup
+    module_logger = logging.getLogger(__name__)
+    module_logger.info(f"Logging initialized - file: {log_file_path}")
+
+    return module_logger, str(log_file_path)
 
 
 class GemmaFeatureExtractor:
@@ -398,12 +450,14 @@ if __name__ == '__main__':
     parser.add_argument('--num_frames', type=int, default=16)
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose/debug logging')
+    parser.add_argument('--log_dir', type=str, default='logs',
+                        help='Directory for log files (default: logs)')
 
     args = parser.parse_args()
 
-    # Setup logging based on verbosity
+    # Setup logging based on verbosity (logs to both console and file)
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    setup_logging(log_level)
+    logger, log_file = setup_logging(log_level, log_dir=args.log_dir)
 
     logger.info("=" * 70)
     logger.info("PALIGEMMA FEATURE EXTRACTOR TEST")
@@ -434,4 +488,5 @@ if __name__ == '__main__':
 
     logger.info("=" * 70)
     logger.info("TEST COMPLETE!")
+    logger.info(f"Log saved to: {log_file}")
     logger.info("=" * 70)

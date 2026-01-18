@@ -19,13 +19,15 @@ Options:
 """
 
 import argparse
+import logging
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import json
 import traceback
+from datetime import datetime
 
-from gemma_feature_extractor import GemmaFeatureExtractor
+from gemma_feature_extractor import GemmaFeatureExtractor, setup_logging
 
 
 def load_wlasl_videos(data_dir, subset_file='nslt_100.json'):
@@ -121,56 +123,64 @@ def main():
                         help='Skip videos with existing features')
     parser.add_argument('--use_flash_attention', action='store_true',
                         help='Enable Flash Attention 2 for faster inference (requires GPU)')
+    parser.add_argument('--log_dir', type=str, default='logs',
+                        help='Directory for log files (default: logs)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Enable verbose/debug logging')
 
     args = parser.parse_args()
 
-    print("="*70)
-    print("GEMMA FEATURE PRE-EXTRACTION")
-    print("="*70)
-    print()
+    # Setup logging (both console and file)
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logger, log_file = setup_logging(
+        level=log_level,
+        log_file=f"gemma_preprocess_{args.subset.replace('.json', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        log_dir=args.log_dir
+    )
+
+    logger.info("=" * 70)
+    logger.info("GEMMA FEATURE PRE-EXTRACTION")
+    logger.info("=" * 70)
+    logger.info(f"Log file: {log_file}")
 
     # ─────────────────────────────────────────────────────────────────
     # 1. Load video list
     # ─────────────────────────────────────────────────────────────────
-    print("Step 1: Loading video list...")
-    print(f"  Data dir: {args.data_dir}")
-    print(f"  Subset: {args.subset}")
+    logger.info("Step 1: Loading video list...")
+    logger.info(f"  Data dir: {args.data_dir}")
+    logger.info(f"  Subset: {args.subset}")
 
     video_paths, video_ids, frame_info = load_wlasl_videos(
         args.data_dir,
         subset_file=args.subset
     )
-    print()
 
     # ─────────────────────────────────────────────────────────────────
     # 2. Initialize Gemma feature extractor
     # ─────────────────────────────────────────────────────────────────
-    print("Step 2: Initializing Gemma feature extractor...")
-    print(f"  Model: {args.model_name}")
-    print(f"  Device: {args.device}")
+    logger.info("Step 2: Initializing Gemma feature extractor...")
+    logger.info(f"  Model: {args.model_name}")
+    logger.info(f"  Device: {args.device}")
 
     extractor = GemmaFeatureExtractor(
         model_name=args.model_name,
         device=args.device,
         use_flash_attention=args.use_flash_attention
     )
-    print()
 
     # ─────────────────────────────────────────────────────────────────
     # 3. Create output directory
     # ─────────────────────────────────────────────────────────────────
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Step 3: Output directory: {output_dir}")
-    print()
+    logger.info(f"Step 3: Output directory: {output_dir}")
 
     # ─────────────────────────────────────────────────────────────────
     # 4. Extract features
     # ─────────────────────────────────────────────────────────────────
-    print("Step 4: Extracting features...")
-    print(f"  Total videos: {len(video_paths)}")
-    print(f"  Frames per video: {args.num_frames}")
-    print()
+    logger.info("Step 4: Extracting features...")
+    logger.info(f"  Total videos: {len(video_paths)}")
+    logger.info(f"  Frames per video: {args.num_frames}")
 
     success_count = 0
     skip_count = 0
@@ -202,30 +212,28 @@ def main():
             success_count += 1
 
         except Exception as e:
-            # Print full traceback for first few errors to help debug
-            if error_count < 3:
-                print(
-                    f"\n  Error processing {video_id} ({type(e).__name__}): {e}")
-                print("  Full traceback:")
-                traceback.print_exc()
+            # Log errors with full traceback for debugging
+            error_msg = f"Error processing {video_id} ({type(e).__name__}): {e}"
+            if error_count < 5:
+                logger.error(error_msg)
+                logger.debug(
+                    f"Full traceback for {video_id}:\n{traceback.format_exc()}")
             else:
-                print(
-                    f"\n  Error processing {video_id} ({type(e).__name__}): {e}")
+                logger.error(error_msg)
             error_count += 1
             continue
 
-    print()
-    print("="*70)
-    print("EXTRACTION COMPLETE!")
-    print("="*70)
-    print(f"✓ Successfully processed: {success_count} videos")
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("EXTRACTION COMPLETE!")
+    logger.info("=" * 70)
+    logger.info(f"✓ Successfully processed: {success_count} videos")
     if skip_count > 0:
-        print(f"✓ Skipped (already exists): {skip_count} videos")
+        logger.info(f"✓ Skipped (already exists): {skip_count} videos")
     if error_count > 0:
-        print(f"✗ Errors: {error_count} videos")
-    print(f"✓ Features saved to: {output_dir}")
-    print(f"✓ Feature dimension: {extractor.feature_dim}")
-    print()
+        logger.warning(f"✗ Errors: {error_count} videos")
+    logger.info(f"✓ Features saved to: {output_dir}")
+    logger.info(f"✓ Feature dimension: {extractor.feature_dim}")
 
     # Save metadata
     metadata = {
@@ -241,8 +249,9 @@ def main():
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"✓ Metadata saved to: {metadata_path}")
-    print()
+    logger.info(f"✓ Metadata saved to: {metadata_path}")
+    logger.info(f"✓ Full log saved to: {log_file}")
+    logger.info("")
 
 
 if __name__ == '__main__':
