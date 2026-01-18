@@ -8,9 +8,49 @@ This is the PRIMARY model for fast training with:
 - 2-4 GB GPU memory requirement
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for temporal sequences."""
+    
+    def __init__(self, d_model: int, max_len: int = 128, dropout: float = 0.1):
+        """
+        Initialize sinusoidal positional encoding.
+        
+        Args:
+            d_model: Dimension of the model
+            max_len: Maximum sequence length
+            dropout: Dropout probability
+        """
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Add positional encoding to input.
+        
+        Args:
+            x: (batch, seq_len, d_model) input tensor
+            
+        Returns:
+            (batch, seq_len, d_model) tensor with positional encoding added
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
 
 class LandmarkEncoder(nn.Module):
@@ -326,14 +366,24 @@ class SimpleHybridASLModel(nn.Module):
         else:
             raise ValueError(f"Unknown fusion type: {fusion_type}")
 
-        # Classifier head
+        # Classifier head - deeper architecture for large num_classes
+        classifier_dim = hidden_dim * 2 if num_classes > 500 else hidden_dim
+        
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, classifier_dim),
+            nn.LayerNorm(classifier_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(classifier_dim, classifier_dim),
+            nn.LayerNorm(classifier_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_dim, num_classes),
         )
+        
+        # Initialize final layer with smaller weights for stability
+        nn.init.xavier_uniform_(self.classifier[-1].weight, gain=0.1)
+        nn.init.zeros_(self.classifier[-1].bias)
 
     def forward(
         self,

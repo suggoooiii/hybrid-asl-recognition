@@ -13,8 +13,10 @@ This is the PRIMARY training pipeline - optimized for fast iteration with:
 import argparse
 import json
 import logging
+import math
 import os
 import random
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -59,6 +61,82 @@ def setup_logging(log_dir: str = "logs", verbose: bool = False) -> tuple:
     logger.info(f"Logging to: {log_file}")
 
     return logger, log_file
+
+
+def compute_class_weights(labels: list, num_classes: int, smoothing: float = 0.1) -> torch.Tensor:
+    """
+    Compute inverse-frequency class weights with smoothing.
+    
+    Args:
+        labels: List of class labels
+        num_classes: Total number of classes
+        smoothing: Smoothing factor to prevent division by zero
+        
+    Returns:
+        torch.FloatTensor of class weights
+    """
+    counts = Counter(labels)
+    counts_array = np.array([counts.get(i, 0) for i in range(num_classes)])
+    counts_array = counts_array + smoothing  # Prevent division by zero
+    weights = 1.0 / counts_array
+    weights = weights * (num_classes / weights.sum())  # Normalize
+    weights = np.clip(weights, 0.1, 10.0)  # Clip extreme values
+    return torch.FloatTensor(weights)
+
+
+def verify_feature_dimensions(gemma_features_dir: str, expected_dim: int) -> int:
+    """
+    Verify pre-extracted features match expected dimensions.
+    
+    Args:
+        gemma_features_dir: Directory containing Gemma feature .npy files
+        expected_dim: Expected feature dimension
+        
+    Returns:
+        Actual feature dimension found (or expected_dim if verified)
+    """
+    logger = logging.getLogger("train_simple")
+    gemma_dir = Path(gemma_features_dir)
+    sample_files = list(gemma_dir.glob("*_gemma.npy"))[:5]
+    
+    if not sample_files:
+        raise FileNotFoundError(f"No .npy files found in {gemma_features_dir}")
+    
+    for f in sample_files:
+        features = np.load(f)
+        actual_dim = features.shape[-1]
+        if actual_dim != expected_dim:
+            logger.warning(f"Feature dimension mismatch! Expected {expected_dim}, got {actual_dim}")
+            logger.warning(f"Auto-adjusting gemma_feature_dim to {actual_dim}")
+            return actual_dim
+    
+    logger.info(f"✓ Feature dimensions verified: {expected_dim}")
+    return expected_dim
+
+
+def get_cosine_schedule_with_warmup(optimizer, warmup_epochs: int, total_epochs: int, steps_per_epoch: int):
+    """
+    Cosine annealing with linear warmup.
+    
+    Args:
+        optimizer: Optimizer to schedule
+        warmup_epochs: Number of warmup epochs
+        total_epochs: Total number of training epochs
+        steps_per_epoch: Number of steps per epoch
+        
+    Returns:
+        LambdaLR scheduler
+    """
+    warmup_steps = warmup_epochs * steps_per_epoch
+    total_steps = total_epochs * steps_per_epoch
+    
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 class FeatureAugmentation:
@@ -372,6 +450,8 @@ def train_epoch(
     device: torch.device,
     epoch: int,
     logger: logging.Logger,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    step_scheduler_per_batch: bool = False,
 ) -> tuple:
     """Train for one epoch."""
     model.train()
@@ -394,6 +474,10 @@ def train_epoch(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        
+        # Step scheduler per batch if using warmup
+        if step_scheduler_per_batch and scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         _, predicted = outputs.max(1)
@@ -471,15 +555,15 @@ def main():
 
     # Model arguments
     parser.add_argument("--gemma_feature_dim", type=int, default=1152,
-                        help="Dimension of Gemma features (1152 for PaliGemma)")
+                        help="Dimension of Gemma features (1152 for PaliGemma, 2048 for Gemma 3)")
     parser.add_argument("--hidden_dim", type=int,
-                        default=256, help="Hidden dimension")
+                        default=512, help="Hidden dimension")
     parser.add_argument("--num_frames", type=int,
                         default=16, help="Number of frames")
     parser.add_argument("--fusion_type", type=str, default="concat",
                         choices=["concat", "attention", "gated"], help="Fusion type")
     parser.add_argument("--dropout", type=float,
-                        default=0.3, help="Dropout rate")
+                        default=0.5, help="Dropout rate")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int,
@@ -494,6 +578,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--val_split", type=float,
                         default=0.2, help="Validation split ratio")
+    parser.add_argument("--label_smoothing", type=float,
+                        default=0.1, help="Label smoothing for loss")
+    parser.add_argument("--warmup_epochs", type=int,
+                        default=5, help="Number of warmup epochs")
+    parser.add_argument("--use_class_weights", action="store_true", default=False,
+                        help="Use class weights in loss function (recommended for imbalanced datasets)")
+    parser.add_argument("--no_class_weights", dest="use_class_weights", action="store_false",
+                        help="Disable class weights in loss function")
 
     # Augmentation arguments
     parser.add_argument("--no_augmentation", action="store_true",
@@ -649,6 +741,14 @@ def main():
     logger.info(f"  Train batches: {len(train_loader)}")
     logger.info(f"  Val batches: {len(val_loader)}")
 
+    # Verify feature dimensions
+    logger.info(f"\nVerifying feature dimensions...")
+    verified_gemma_dim = verify_feature_dimensions(
+        args.gemma_features_dir, args.gemma_feature_dim
+    )
+    if verified_gemma_dim != args.gemma_feature_dim:
+        args.gemma_feature_dim = verified_gemma_dim
+
     # Create model
     model = SimpleHybridASLModel(
         num_classes=num_classes,
@@ -669,27 +769,52 @@ def main():
     logger.info(f"  Fusion type: {args.fusion_type}")
 
     # Setup training
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Compute class weights if enabled
+    class_weights = None
+    if args.use_class_weights:
+        logger.info(f"\nComputing class weights for {num_classes} classes...")
+        class_weights = compute_class_weights(train_labels, num_classes)
+        class_weights = class_weights.to(device)
+        logger.info(f"  Class weights computed (min: {class_weights.min():.2f}, max: {class_weights.max():.2f})")
+    
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing
+    )
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
-    )
+    
+    # Use warmup scheduler if warmup_epochs > 0
+    if args.warmup_epochs > 0:
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, 
+            warmup_epochs=args.warmup_epochs,
+            total_epochs=args.epochs,
+            steps_per_epoch=len(train_loader)
+        )
+        scheduler_type = f"CosineAnnealingLR with {args.warmup_epochs} warmup epochs"
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
+        scheduler_type = f"CosineAnnealingLR (T_max={args.epochs})"
 
     logger.info(f"\nTraining setup:")
     logger.info(
         f"  Optimizer: AdamW (lr={args.lr}, weight_decay={args.weight_decay})")
-    logger.info(f"  Scheduler: CosineAnnealingLR (T_max={args.epochs})")
-    logger.info(f"  Loss: CrossEntropyLoss (label_smoothing=0.1)")
+    logger.info(f"  Scheduler: {scheduler_type}")
+    logger.info(f"  Loss: CrossEntropyLoss (label_smoothing={args.label_smoothing}, class_weights={args.use_class_weights})")
 
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # Training loop
     best_val_acc = 0
+    step_scheduler_per_batch = args.warmup_epochs > 0
     logger.info("\n" + "=" * 70)
     logger.info("TRAINING START")
     logger.info("=" * 70)
@@ -699,7 +824,9 @@ def main():
 
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, logger
+            model, train_loader, criterion, optimizer, device, epoch, logger,
+            scheduler=scheduler if step_scheduler_per_batch else None,
+            step_scheduler_per_batch=step_scheduler_per_batch
         )
 
         # Validate
@@ -707,8 +834,9 @@ def main():
             model, val_loader, criterion, device, logger
         )
 
-        # Update scheduler
-        scheduler.step()
+        # Update scheduler (only if not stepping per batch)
+        if not step_scheduler_per_batch:
+            scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         # Log results
