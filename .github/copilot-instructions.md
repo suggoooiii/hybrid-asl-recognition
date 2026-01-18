@@ -3,6 +3,7 @@
 ## Project Overview
 
 A **hybrid American Sign Language (ASL) recognition system** combining:
+
 - **VideoMAE** (Visual Masked Autoencoder) for deep visual features
 - **MediaPipe** for explicit hand/pose landmark features (162 dims/frame)
 
@@ -17,37 +18,42 @@ Video → [MediaPipe Branch] → Landmark Features (256-dim)┘
 ```
 
 ### Key Files
-| File | Purpose |
-|------|---------|
-| `hybrid_asl_model.py` | Core: `HybridASLModel`, `MediaPipeLandmarkExtractor`, `LandmarkEncoder`, `VideoMAEEncoder`, `HybridASLTrainer` |
-| `train_hybrid_asl.py` | Training with WLASL dataset loading |
-| `webcam_hybrid_asl.py` | Real-time webcam inference |
-| `extract_landmarks.py` | Standalone landmark extraction |
+
+| File                   | Purpose                                                                                                        |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `hybrid_asl_model.py`  | Core: `HybridASLModel`, `MediaPipeLandmarkExtractor`, `LandmarkEncoder`, `VideoMAEEncoder`, `HybridASLTrainer` |
+| `train_hybrid_asl.py`  | Training with WLASL dataset loading                                                                            |
+| `webcam_hybrid_asl.py` | Real-time webcam inference                                                                                     |
+| `extract_landmarks.py` | Standalone landmark extraction                                                                                 |
 
 ## Feature Vector Structure (162 dims/frame)
 
-| Component | Indices | Size | Source |
-|-----------|---------|------|--------|
-| Left hand | 0-62 | 63 | 21 landmarks × 3 coords |
-| Right hand | 63-125 | 63 | 21 landmarks × 3 coords |
-| Upper body | 126-161 | 36 | 12 pose landmarks (11-22) |
+| Component  | Indices | Size | Source                    |
+| ---------- | ------- | ---- | ------------------------- |
+| Left hand  | 0-62    | 63   | 21 landmarks × 3 coords   |
+| Right hand | 63-125  | 63   | 21 landmarks × 3 coords   |
+| Upper body | 126-161 | 36   | 12 pose landmarks (11-22) |
 
 Pad with `[0.0] * N` when landmarks not detected.
 
 ## Critical Patterns
 
 ### MediaPipe Tasks API (NOT legacy Holistic)
+
 ```python
 from mediapipe.tasks.vision import HandLandmarker, PoseLandmarker, RunningMode
 ```
+
 Models auto-downloaded by `download_mediapipe_models()`.
 
 ### VideoMAE Processing
+
 - Model: `MCG-NJU/videomae-base` (768 → 256 projected)
 - 16 frames sampled uniformly
 - Use `VideoMAEImageProcessor.from_pretrained()`
 
 ### Fusion Strategies
+
 - `concat` (default): Concatenation + linear projection
 - `attention`: Cross-attention between streams
 - `gated`: Learnable gate for stream contribution
@@ -78,33 +84,37 @@ python webcam_hybrid_asl.py --device cuda
 ## Common Pitfalls & Edge Cases
 
 ### GPU/Memory Issues
+
 - **VideoMAE is memory-hungry**: Reduce `--batch_size` (try 4 or 2) if OOM
 - Default device is `cuda`; use `--device cpu` or `--device mps` (Apple Silicon) if unavailable
 - VideoMAE backbone alone is ~86M params
 
 ### Video Processing Failures
+
 - **Missing videos**: ~9100 videos in `missing.txt` are unavailable; the loader skips them automatically
 - **Corrupted/empty videos**: `cv2.VideoCapture` returns empty frames; padding kicks in but may hurt accuracy
 - **FPS detection**: Falls back to 30 FPS if `CAP_PROP_FPS` returns 0
 
 ### MediaPipe Edge Cases
+
 - **No hands detected**: Returns `[0.0] * 63` for that hand—common in occlusion
 - **Hand chirality flip**: MediaPipe's "Left"/"Right" is from camera's perspective (mirrored in webcam)
 - **Timestamp required**: Must increment monotonically for VIDEO mode; use `int(frame_idx * 1000 / fps)`
 
 ### Label Mapping
+
 - `label_mapping.json` uses **string keys** (JSON limitation): `{"0": "book", "1": "drink", ...}`
 - Load with: `{int(k): v for k, v in json.load(f).items()}` if you need int keys
 
 ## Training Configuration
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| VideoMAE LR | 0.1× base | Differential learning rate |
-| Scheduler | CosineAnnealingLR | T_max=50, eta_min=1e-6 |
-| Gradient clip | max_norm=1.0 | Prevents explosion |
-| Dropout | 0.3 | Throughout model |
-| Train/Val split | 80/20 | Random with seed=42 |
+| Parameter       | Value             | Notes                      |
+| --------------- | ----------------- | -------------------------- |
+| VideoMAE LR     | 0.1× base         | Differential learning rate |
+| Scheduler       | CosineAnnealingLR | T_max=50, eta_min=1e-6     |
+| Gradient clip   | max_norm=1.0      | Prevents explosion         |
+| Dropout         | 0.3               | Throughout model           |
+| Train/Val split | 80/20             | Random with seed=42        |
 
 ## Output Files
 
@@ -114,6 +124,7 @@ python webcam_hybrid_asl.py --device cuda
 ## Research Extensions (Future)
 
 When extending for research, consider:
+
 - **Ablation studies**: Compare VideoMAE-only vs Landmark-only vs Hybrid
 - **Fusion comparison**: Benchmark `concat` vs `attention` vs `gated`
 - **Cross-dataset**: Test generalization to other sign language datasets
