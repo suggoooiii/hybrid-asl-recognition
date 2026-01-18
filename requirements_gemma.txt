@@ -1,0 +1,13 @@
+# Additional dependencies for Gemma 3 integration
+# These are in addition to the base requirements.txt
+
+# Gemma 3 multimodal model support
+transformers>=4.51.3
+huggingface_hub>=0.20.0
+
+# Accelerate for efficient model loading
+accelerate>=0.25.0
+
+# Optional: For quantization to reduce memory usage
+# Uncomment if you want to use 8-bit or 4-bit quantization
+# bitsandbytes>=0.41.0

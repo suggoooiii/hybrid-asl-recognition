@@ -1,2 +1,19 @@
 data/
 data.zip
+
+# Pre-extracted features (too large for git)
+*.npy
+gemma_features/
+landmarks/
+
+# Model checkpoints
+checkpoints/
+checkpoints_simple/
+*.pth
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
