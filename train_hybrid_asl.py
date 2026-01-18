@@ -35,43 +35,100 @@ def download_mediapipe_models():
             print(f"✓ Downloaded {filename}")
 
 
-def load_wlasl_dataset(data_dir):
+def load_wlasl_dataset(data_dir, subset_file='nslt_100.json', split=None):
     """
-    Load WLASL dataset. 
-    Adjust this function based on your WLASL directory structure.
+    Load WLASL dataset using flat video structure with JSON annotations.
+    
+    Args:
+        data_dir: Path to wlasl data directory (containing videos/ and JSON files)
+        subset_file: Which subset to use ('nslt_100.json', 'nslt_300.json', etc.)
+        split: Optional filter for 'train', 'val', or 'test'. None = all splits.
+    
+    Returns:
+        video_paths: List of video file paths
+        labels: List of class indices
+        idx_to_gloss: Dict mapping class index to gloss name
     """
     data_dir = Path(data_dir)
+    videos_dir = data_dir / 'videos'
+    
+    # Load subset config (video_id -> class mapping)
+    subset_path = data_dir / subset_file
+    if not subset_path.exists():
+        raise FileNotFoundError(f"Subset file not found: {subset_path}")
+    
+    with open(subset_path, 'r') as f:
+        subset_data = json.load(f)
+    
+    # Load main annotations (for gloss names)
+    wlasl_path = data_dir / 'WLASL_v0.3.json'
+    if not wlasl_path.exists():
+        raise FileNotFoundError(f"WLASL annotations not found: {wlasl_path}")
+    
+    with open(wlasl_path, 'r') as f:
+        wlasl_data = json.load(f)
+    
+    # Build video_id -> gloss mapping from WLASL_v0.3.json
+    video_id_to_gloss = {}
+    for entry in wlasl_data:
+        gloss = entry['gloss']
+        for instance in entry['instances']:
+            video_id_to_gloss[instance['video_id']] = gloss
+    
+    # Build class_idx -> gloss mapping (inferred from subset data)
+    idx_to_gloss = {}
+    for video_id, info in subset_data.items():
+        class_idx = info['action'][0]
+        if video_id in video_id_to_gloss:
+            gloss = video_id_to_gloss[video_id]
+            if class_idx not in idx_to_gloss:
+                idx_to_gloss[class_idx] = gloss
     
     video_paths = []
     labels = []
-    label_to_idx = {}
+    skipped = 0
     
-    # Typical WLASL structure:  data_dir/videos/{gloss}/video_id.mp4
-    # Adjust based on your actual structure
-    
-    for video_file in data_dir.glob('**/*.mp4'):
-        # Extract label from parent folder name
-        gloss = video_file.parent. name
+    for video_id, info in subset_data.items():
+        # Filter by split if specified
+        if split is not None and info['subset'] != split:
+            continue
         
-        if gloss not in label_to_idx:
-            label_to_idx[gloss] = len(label_to_idx)
+        video_path = videos_dir / f"{video_id}.mp4"
         
-        video_paths.append(str(video_file))
-        labels.append(label_to_idx[gloss])
+        # Only include videos that exist
+        if not video_path.exists():
+            skipped += 1
+            continue
+        
+        class_idx = info['action'][0]
+        
+        video_paths.append(str(video_path))
+        labels.append(class_idx)
     
     print(f"Found {len(video_paths)} videos")
-    print(f"Found {len(label_to_idx)} classes")
+    print(f"Found {len(idx_to_gloss)} classes")
+    if skipped > 0:
+        print(f"Skipped {skipped} missing videos")
+    if split:
+        print(f"Using split: {split}")
     
-    # Save label mapping
+    # Save label mapping (idx -> gloss for inference)
     with open('label_mapping.json', 'w') as f:
-        json.dump(label_to_idx, f, indent=2)
+        # Convert int keys to strings for JSON
+        json.dump({str(k): v for k, v in idx_to_gloss.items()}, f, indent=2)
     
-    return video_paths, labels, label_to_idx
+    return video_paths, labels, idx_to_gloss
 
 
 def main():
-    parser = argparse. ArgumentParser(description='Train Hybrid ASL Model')
+    parser = argparse.ArgumentParser(description='Train Hybrid ASL Model')
     parser.add_argument('--data_dir', type=str, required=True, help='Path to WLASL dataset')
+    parser.add_argument('--subset', type=str, default='nslt_100.json',
+                        choices=['nslt_100.json', 'nslt_300.json', 'nslt_1000.json', 'nslt_2000.json'],
+                        help='Subset file to use (vocabulary size)')
+    parser.add_argument('--split', type=str, default=None,
+                        choices=['train', 'val', 'test'],
+                        help='Use specific split from JSON (default: use all with random split)')
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
@@ -100,8 +157,14 @@ def main():
     # 2. Load dataset
     # ─────────────────────────────────────────────────────────────────
     print("Step 2: Loading WLASL dataset...")
-    video_paths, labels, label_to_idx = load_wlasl_dataset(args.data_dir)
-    num_classes = len(label_to_idx)
+    print(f"  Subset: {args.subset}")
+    print(f"  Split filter: {args.split or 'None (using random 80/20 split)'}")
+    video_paths, labels, idx_to_gloss = load_wlasl_dataset(
+        args.data_dir, 
+        subset_file=args.subset,
+        split=args.split
+    )
+    num_classes = len(idx_to_gloss)
     print()
     
     # ─────────────────────────────────────────────────────────────────
