@@ -12,6 +12,7 @@ Architecture:
 Supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -295,6 +296,45 @@ class MediaPipeLandmarkExtractor:
 # LANDMARK ENCODER (Transformer-based)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for temporal sequences."""
+    
+    def __init__(self, d_model: int, max_len: int = 128, dropout: float = 0.1):
+        """
+        Initialize sinusoidal positional encoding.
+        
+        Args:
+            d_model: Dimension of the model
+            max_len: Maximum sequence length
+            dropout: Dropout probability
+        """
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Add positional encoding to input.
+        
+        Args:
+            x: (batch, seq_len, d_model) input tensor
+            
+        Returns:
+            (batch, seq_len, d_model) tensor with positional encoding added
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
 class LandmarkEncoder(nn.Module):
     """
     Transformer encoder for landmark sequences. 
@@ -308,7 +348,8 @@ class LandmarkEncoder(nn.Module):
                  hidden_dim=256,
                  num_heads=4,
                  num_layers=2,
-                 dropout=0.3):
+                 dropout=0.3,
+                 use_sinusoidal_pos=True):
         super().__init__()
 
         # Project landmarks to hidden dimension
@@ -320,7 +361,16 @@ class LandmarkEncoder(nn.Module):
         )
 
         # Positional encoding
-        self.pos_encoding = nn.Parameter(torch.randn(1, 64, hidden_dim) * 0.02)
+        self.use_sinusoidal_pos = use_sinusoidal_pos
+        if use_sinusoidal_pos:
+            self.pos_encoding = SinusoidalPositionalEncoding(
+                d_model=hidden_dim,
+                max_len=128,
+                dropout=0.0  # Dropout already in input_projection
+            )
+        else:
+            # Legacy random positional encoding (for backward compatibility)
+            self.pos_encoding = nn.Parameter(torch.randn(1, 64, hidden_dim) * 0.02)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
@@ -355,7 +405,10 @@ class LandmarkEncoder(nn.Module):
         x = self.input_projection(x)
 
         # Add positional encoding
-        x = x + self.pos_encoding[:, :seq_len, :]
+        if self.use_sinusoidal_pos:
+            x = self.pos_encoding(x)
+        else:
+            x = x + self.pos_encoding[:, :seq_len, :]
 
         # Transformer encoding
         x = self.transformer(x)

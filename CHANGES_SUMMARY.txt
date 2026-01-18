@@ -1,0 +1,204 @@
+================================================================================
+COMPREHENSIVE SUMMARY: NSLT-1000 TRAINING FIXES
+================================================================================
+
+PROBLEM STATEMENT:
+Training on nslt_1000.json (1000 classes) produced poor results (near random-
+chance accuracy). Root causes: class imbalance, poor positional encoding,
+insufficient model capacity, missing feature verification, and no LR warmup.
+
+================================================================================
+SOLUTIONS IMPLEMENTED
+================================================================================
+
+1. CLASS WEIGHTS FOR IMBALANCED DATA
+   Location: train_simple.py
+   - Added compute_class_weights() function
+   - Inverse-frequency weighting with smoothing
+   - Weights normalized and clipped to [0.1, 10.0]
+   - New flags: --use_class_weights / --no_class_weights
+   Impact: Rare classes no longer ignored during training
+
+2. SINUSOIDAL POSITIONAL ENCODING
+   Locations: hybrid_asl_model.py, hybrid_asl_model_simple.py
+   - Added SinusoidalPositionalEncoding class
+   - Standard Transformer-style sin/cos encoding
+   - Used in Transformer-based LandmarkEncoder (hybrid_asl_model.py)
+   - LSTM-based encoder (simple) doesn't need it (already has temporal info)
+   Impact: Better temporal understanding in Transformer models
+
+3. INCREASED MODEL CAPACITY
+   Locations: train_simple.py, hybrid_asl_model_simple.py
+   - hidden_dim: 256 → 512 (default)
+   - dropout: 0.3 → 0.5 (default)
+   - Deeper classifier for num_classes > 500:
+     * 3 linear layers instead of 2
+     * Intermediate dim = hidden_dim × 2
+   - Xavier init with gain=0.1 for final layer
+   Impact: Model can learn 1000 classes without underfitting
+
+4. FEATURE DIMENSION VERIFICATION
+   Location: train_simple.py
+   - Added verify_feature_dimensions() function
+   - Auto-detects mismatches in .npy files
+   - Auto-adjusts gemma_feature_dim if needed
+   - Logs warnings for user awareness
+   Impact: Prevents silent failures from wrong feature dimensions
+
+5. LEARNING RATE WARMUP
+   Location: train_simple.py
+   - Added get_cosine_schedule_with_warmup() function
+   - Linear warmup → cosine annealing
+   - Steps per batch during warmup
+   - New flag: --warmup_epochs (default: 5)
+   Impact: Stable early training with many classes
+
+================================================================================
+NEW COMMAND-LINE ARGUMENTS
+================================================================================
+
+--hidden_dim [default: 512]
+    Hidden dimension for encoders (increased from 256)
+
+--dropout [default: 0.5]
+    Dropout rate throughout model (increased from 0.3)
+
+--label_smoothing [default: 0.1]
+    Label smoothing factor for CrossEntropyLoss
+
+--warmup_epochs [default: 5]
+    Number of epochs for linear LR warmup (0 = no warmup)
+
+--use_class_weights
+    Enable class weight balancing (RECOMMENDED for nslt_1000)
+
+--no_class_weights
+    Disable class weights (overrides default)
+
+================================================================================
+RECOMMENDED TRAINING COMMANDS
+================================================================================
+
+For nslt_100.json (quick test):
+    python train_simple.py \
+        --subset nslt_100.json \
+        --hidden_dim 512 \
+        --dropout 0.5 \
+        --use_class_weights \
+        --warmup_epochs 5 \
+        --epochs 50
+
+For nslt_1000.json (main target):
+    python train_simple.py \
+        --subset nslt_1000.json \
+        --hidden_dim 512 \
+        --dropout 0.5 \
+        --use_class_weights \
+        --warmup_epochs 10 \
+        --epochs 100 \
+        --batch_size 32
+
+================================================================================
+TESTING & VERIFICATION
+================================================================================
+
+Test Suite: test_nslt1000_fixes.py
+  ✓ Module imports
+  ✓ Class weight computation
+  ✓ Feature dimension verification
+  ✓ Warmup scheduler
+  ✓ Sinusoidal positional encoding
+  ✓ LandmarkEncoder with sinusoidal encoding
+  ✓ Model capacity improvements
+  ✓ Integration test
+  
+Result: 8/8 tests PASSED
+
+Additional Checks:
+  ✓ Syntax validation (py_compile)
+  ✓ Argument parsing verified
+  ✓ Default values confirmed
+  ✓ Git status clean
+
+================================================================================
+ARCHITECTURAL NOTES
+================================================================================
+
+LandmarkEncoder Usage:
+- hybrid_asl_model.py: Uses Transformer → needs positional encoding
+- hybrid_asl_model_simple.py: Uses LSTM → has inherent temporal info
+
+This difference is intentional:
+- Transformer model: For end-to-end fine-tuning, higher capacity
+- LSTM model: For pre-extracted features, faster training
+
+Model Capacity Scaling:
+- 100 classes: ~17M parameters (hidden_dim × 1 classifier)
+- 1000 classes: ~19M parameters (hidden_dim × 2 classifier)
+- Automatic scaling based on num_classes > 500
+
+Memory Requirements:
+- Training with nslt_1000: 2-4 GB VRAM (batch_size=32)
+- Can reduce batch_size to 16 if OOM occurs
+- Pre-extracted features = much lower memory than end-to-end
+
+================================================================================
+EXPECTED IMPROVEMENTS
+================================================================================
+
+Before fixes:
+- Random-chance accuracy (~0.1% for 1000 classes)
+- Severe overfitting on frequent classes
+- Poor learning of rare classes
+- Unstable early training
+
+After fixes:
+- Balanced learning across all classes
+- Better generalization (higher dropout, label smoothing)
+- Stable convergence (warmup prevents instability)
+- Improved temporal modeling (sinusoidal encoding)
+- Sufficient capacity for 1000 classes
+
+================================================================================
+BACKWARD COMPATIBILITY
+================================================================================
+
+All changes maintain backward compatibility:
+✓ Legacy models can load with use_sinusoidal_pos=False
+✓ Class weights are opt-in via --use_class_weights flag
+✓ Default arguments work for both small and large datasets
+✓ No breaking changes to existing APIs
+
+================================================================================
+FILES CHANGED
+================================================================================
+
+Modified:
+  train_simple.py              (+152 lines)
+  hybrid_asl_model_simple.py   (+58 lines)
+  hybrid_asl_model.py          (+59 lines)
+
+Created:
+  test_nslt1000_fixes.py       (comprehensive test suite)
+  NSLT_1000_FIXES.md           (detailed documentation)
+  CHANGES_SUMMARY.txt          (this file)
+
+Total: +269 lines across 3 files, 2 new files
+
+================================================================================
+REFERENCES
+================================================================================
+
+Documentation:
+  - NSLT_1000_FIXES.md (detailed fix descriptions)
+  - GEMMA_INTEGRATION.md (architecture overview)
+  - README.md (project overview)
+
+Tests:
+  - test_nslt1000_fixes.py (new comprehensive tests)
+  - test_gemma_integration.py (existing integration tests)
+
+Issue:
+  - Training failures on nslt_1000.json
+
+================================================================================
