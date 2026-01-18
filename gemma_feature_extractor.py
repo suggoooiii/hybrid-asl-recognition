@@ -119,10 +119,10 @@ class GemmaFeatureExtractor:
         pil_image = Image.fromarray(frame)
 
         with torch.no_grad():
-            # Process image - PaliGemma processor needs text input
+            # Process image - PaliGemma processor needs <image> token in text
             inputs = self.processor(
                 images=pil_image,
-                text="",  # Empty text for feature extraction only
+                text="<image>",  # Required image token for PaliGemma
                 return_tensors="pt"
             )
 
@@ -253,10 +253,10 @@ class GemmaFeatureExtractor:
         pil_images = [Image.fromarray(f) for f in frames]
 
         with torch.no_grad():
-            # Process all frames at once
+            # Process all frames at once - PaliGemma needs <image> token
             inputs = self.processor(
                 images=pil_images,
-                text=[""] * len(pil_images),
+                text=["<image>"] * len(pil_images),
                 return_tensors="pt",
                 padding=True
             )
